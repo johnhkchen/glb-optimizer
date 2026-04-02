@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GLB Optimizer</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="app">
+        <header class="header">
+            <h1>GLB Optimizer</h1>
+            <span class="subtitle">gltfpack wrapper with 3D preview</span>
+        </header>
+
+        <!-- Left Panel - File List -->
+        <div class="panel-left">
+            <div class="drop-zone" id="dropZone">
+                <p>Drop .glb files here</p>
+                <button class="browse-btn" id="browseBtn">Browse Files</button>
+                <input type="file" id="fileInput" accept=".glb" multiple hidden>
+            </div>
+
+            <div class="file-list" id="fileList"></div>
+
+            <div class="panel-actions">
+                <button class="btn btn-primary" id="processAllBtn" disabled>Process All</button>
+                <button class="btn btn-secondary" id="downloadAllBtn" style="display:none">Download All (.zip)</button>
+            </div>
+        </div>
+
+        <!-- Center Panel - Preview -->
+        <div class="panel-center">
+            <div class="preview-toolbar" id="previewToolbar" style="display:none">
+                <div class="preview-toggle">
+                    <button id="btnOriginal" class="active">Original</button>
+                    <button id="btnOptimized" disabled>Optimized</button>
+                </div>
+                <div class="lod-toggle" id="lodToggle" style="display:none">
+                    <button data-lod="lod0" disabled>LOD0</button>
+                    <button data-lod="lod1" disabled>LOD1</button>
+                    <button data-lod="lod2" disabled>LOD2</button>
+                    <button data-lod="lod3" disabled>LOD3</button>
+                    <button data-lod="billboard" disabled>Billboard</button>
+                </div>
+                <button class="wireframe-toggle" id="wireframeBtn">Wireframe</button>
+                <div class="toolbar-actions">
+                    <button class="toolbar-btn" id="generateLodsBtn" disabled>LODs (gltfpack)</button>
+                    <button class="toolbar-btn toolbar-btn-blender" id="generateBlenderLodsBtn" disabled style="display:none">LODs (Blender)</button>
+                    <button class="toolbar-btn" id="generateBillboardBtn" disabled>Billboard</button>
+                </div>
+                <div class="stress-controls">
+                    <label class="stress-label">Count:</label>
+                    <input type="range" id="stressCount" min="1" max="100" value="1" class="stress-slider">
+                    <span id="stressCountValue" class="stress-value">1x</span>
+                    <label class="stress-label"><input type="checkbox" id="stressUseLods"> LOD</label>
+                    <label class="stress-label" id="lodQualityLabel" style="display:none">Quality:</label>
+                    <input type="range" id="lodQuality" min="0" max="100" value="50" class="stress-slider" style="display:none;width:60px" title="Higher = more high-detail instances">
+                    <span id="lodQualityValue" class="stress-value" style="display:none">50%</span>
+                    <button class="wireframe-toggle" id="stressBtn">Run</button>
+                </div>
+            </div>
+            <div class="preview-stats" id="previewStats" style="display:none">
+                <span>Triangles: <span class="stat-value" id="statTriangles">—</span></span>
+                <span>Vertices: <span class="stat-value" id="statVertices">—</span></span>
+                <span>File size: <span class="stat-value" id="statSize">—</span></span>
+            </div>
+            <div class="fps-overlay" id="fpsOverlay" style="display:none">
+                <span>FPS: <span class="stat-value" id="fpsValue">—</span></span>
+                <span>Instances: <span class="stat-value" id="instanceCount">—</span></span>
+                <span>Total tris: <span class="stat-value" id="totalTris">—</span></span>
+                <span>Draw calls: <span class="stat-value" id="drawCalls">—</span></span>
+                <span>Est. memory: <span class="stat-value" id="estMemory">—</span></span>
+            </div>
+            <canvas id="preview-canvas" style="display:none"></canvas>
+            <div class="preview-placeholder" id="previewPlaceholder">
+                Select or drop a file to preview
+            </div>
+        </div>
+
+        <!-- Right Panel - Settings -->
+        <div class="panel-right">
+            <div class="presets">
+                <button class="preset-btn" data-preset="quality">Max Quality</button>
+                <button class="preset-btn" data-preset="balanced">Balanced</button>
+                <button class="preset-btn" data-preset="smallest">Smallest</button>
+            </div>
+            <div class="presets">
+                <button class="preset-btn preset-mobile" data-preset="scene">Scene-ready</button>
+                <button class="preset-btn preset-mobile" data-preset="mobile100">Mobile 100x</button>
+            </div>
+
+            <div class="settings-section">
+                <h3>Mesh Settings</h3>
+
+                <div class="setting-row">
+                    <label>
+                        Simplification ratio
+                        <span class="flag-name">-si</span>
+                    </label>
+                    <input type="range" id="simplification" min="0.01" max="1" step="0.01" value="1.0">
+                    <div style="text-align:right"><span class="range-value" id="simplificationValue">1.00</span></div>
+                </div>
+
+                <div class="setting-row">
+                    <label>Compression</label>
+                    <div class="radio-group">
+                        <label><input type="radio" name="compression" value=""> None</label>
+                        <label><input type="radio" name="compression" value="cc" checked> Meshopt <span class="flag-name">-cc</span></label>
+                        <label><input type="radio" name="compression" value="cz"> Meshopt + KHR <span class="flag-name">-cz</span></label>
+                    </div>
+                </div>
+
+                <div class="setting-row">
+                    <div class="checkbox-row">
+                        <input type="checkbox" id="aggressiveSimplify">
+                        <label for="aggressiveSimplify">Aggressive simplify</label>
+                        <span class="flag-name">-sa</span>
+                    </div>
+                    <div class="tooltip">Ignore quality limits — force target ratio</div>
+                </div>
+
+                <div class="setting-row">
+                    <div class="checkbox-row">
+                        <input type="checkbox" id="permissiveSimplify">
+                        <label for="permissiveSimplify">Permissive simplify</label>
+                        <span class="flag-name">-sp</span>
+                    </div>
+                    <div class="tooltip">Simplify across UV/normal seams</div>
+                </div>
+
+                <div class="setting-row">
+                    <div class="checkbox-row">
+                        <input type="checkbox" id="lockBorders">
+                        <label for="lockBorders">Lock border vertices</label>
+                        <span class="flag-name">-slb</span>
+                    </div>
+                    <div class="tooltip">Prevent gaps between connected meshes</div>
+                </div>
+
+                <div class="setting-row">
+                    <div class="checkbox-row">
+                        <input type="checkbox" id="keepNodes">
+                        <label for="keepNodes">Keep named nodes</label>
+                        <span class="flag-name">-kn</span>
+                    </div>
+                </div>
+
+                <div class="setting-row">
+                    <div class="checkbox-row">
+                        <input type="checkbox" id="keepMaterials">
+                        <label for="keepMaterials">Keep named materials</label>
+                        <span class="flag-name">-km</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="settings-section">
+                <h3>Texture Settings</h3>
+
+                <div class="setting-row">
+                    <label>Texture compression</label>
+                    <div class="radio-group">
+                        <label><input type="radio" name="texCompression" value="" checked> None</label>
+                        <label><input type="radio" name="texCompression" value="tc"> KTX2 BasisU <span class="flag-name">-tc</span></label>
+                        <label><input type="radio" name="texCompression" value="tw"> WebP <span class="flag-name">-tw</span></label>
+                    </div>
+                </div>
+
+                <div class="setting-row" id="texQualityRow" style="display:none">
+                    <label>
+                        Texture quality
+                        <span class="flag-name">-tq</span>
+                    </label>
+                    <input type="range" id="textureQuality" min="1" max="10" step="1" value="8">
+                    <div style="text-align:right"><span class="range-value" id="texQualityValue">8</span></div>
+                </div>
+
+                <div class="setting-row">
+                    <label>
+                        Texture size limit
+                        <span class="flag-name">-tl</span>
+                    </label>
+                    <select id="textureSize">
+                        <option value="0">Original</option>
+                        <option value="2048">2048</option>
+                        <option value="1024">1024</option>
+                        <option value="512">512</option>
+                        <option value="256">256</option>
+                    </select>
+                </div>
+            </div>
+
+            <div class="settings-section">
+                <h3>Output</h3>
+
+                <div class="setting-row">
+                    <div class="checkbox-row">
+                        <input type="checkbox" id="floatPositions">
+                        <label for="floatPositions">Floating-point positions</label>
+                        <span class="flag-name">-vpf</span>
+                    </div>
+                    <div class="tooltip">Use when quantization causes visible artifacts</div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+            "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+        }
+    }
+    </script>
+    <script src="app.js" type="module"></script>
+</body>
+</html>

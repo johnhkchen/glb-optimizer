@@ -2,6 +2,7 @@
 # https://github.com/github/gitignore/blob/main/community/Golang/Go.AllowList.gitignore
 #
 # Binaries for programs and plugins
+glb-optimizer
 *.exe
 *.exe~
 *.dll
@@ -30,3 +31,13 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# Downloaded archives
+*.zip
+
+# Lisa tooling
+.lisa.toml
+.lisa/
+
+# Claude memory
+.claude/
