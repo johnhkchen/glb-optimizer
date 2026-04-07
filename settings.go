@@ -71,12 +71,13 @@ var validResolutions = map[int]bool{
 // env gradient) live in static/presets/lighting.js — the backend only
 // validates that the id is one of the known set. Added in T-007-01.
 var validLightingPresets = map[string]bool{
-	"default":     true,
-	"midday-sun":  true,
-	"overcast":    true,
-	"golden-hour": true,
-	"dusk":        true,
-	"indoor":      true,
+	"default":              true,
+	"midday-sun":           true,
+	"overcast":             true,
+	"golden-hour":          true,
+	"dusk":                 true,
+	"indoor":               true,
+	"from-reference-image": true,
 }
 
 // validSliceDistributionModes enumerates the allowed values for

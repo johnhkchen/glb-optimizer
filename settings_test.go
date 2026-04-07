@@ -100,6 +100,7 @@ func TestValidate_AcceptsAllPresets(t *testing.T) {
 		"golden-hour",
 		"dusk",
 		"indoor",
+		"from-reference-image",
 	}
 	for _, id := range ids {
 		t.Run(id, func(t *testing.T) {
