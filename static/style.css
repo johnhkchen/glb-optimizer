@@ -643,6 +643,28 @@ select option {
     font-style: italic;
 }
 
+.file-item .settings-dirty-mark {
+    color: var(--accent);
+    font-size: 10px;
+    margin-left: 4px;
+    vertical-align: middle;
+}
+
+.dirty-dot {
+    display: inline-block;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: transparent;
+    margin-left: 6px;
+    vertical-align: middle;
+    transition: background 0.15s;
+}
+
+.dirty-dot.dirty {
+    background: var(--accent);
+}
+
 /* Spinner */
 @keyframes spin {
     to { transform: rotate(360deg); }
@@ -674,4 +696,118 @@ select option {
 
 ::-webkit-scrollbar-thumb:hover {
     background: #3a3a5a;
+}
+
+/* Profiles section (T-003-03) */
+#profilesSection #profileSelect {
+    width: 100%;
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--panel-border);
+    border-radius: 4px;
+    padding: 6px 8px;
+    font-size: 12px;
+}
+.profile-actions {
+    display: flex;
+    gap: 8px;
+}
+.profile-actions button {
+    flex: 1;
+    background: var(--panel-bg);
+    color: var(--text);
+    border: 1px solid var(--panel-border);
+    border-radius: 4px;
+    padding: 6px 10px;
+    cursor: pointer;
+    font-size: 12px;
+}
+.profile-actions button:hover:not(:disabled) {
+    background: #2a2a4a;
+}
+.profile-actions button:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+#profileNameInput,
+#profileCommentInput {
+    width: 100%;
+    background: var(--bg);
+    color: var(--text);
+    border: 1px solid var(--panel-border);
+    border-radius: 4px;
+    padding: 6px 8px;
+    font-size: 12px;
+    font-family: inherit;
+    margin-bottom: 6px;
+}
+#profileCommentInput {
+    resize: vertical;
+}
+#profileNameInput.invalid {
+    border-color: var(--error);
+}
+.profile-name-error {
+    color: var(--error);
+    font-size: 11px;
+    min-height: 14px;
+    margin-bottom: 4px;
+}
+.profile-form-actions {
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
+}
+.profile-form-actions button {
+    background: var(--panel-bg);
+    color: var(--text);
+    border: 1px solid var(--panel-border);
+    border-radius: 4px;
+    padding: 6px 12px;
+    cursor: pointer;
+    font-size: 12px;
+}
+.profile-form-actions button:hover {
+    background: #2a2a4a;
+}
+#profileSaveSubmitBtn {
+    background: var(--accent);
+    border-color: var(--accent);
+}
+#profileSaveSubmitBtn:hover {
+    background: var(--accent-hover);
+}
+
+/* T-003-04 Accepted */
+#acceptedSection textarea {
+    width: 100%;
+    background: var(--panel-bg);
+    color: var(--text);
+    border: 1px solid var(--panel-border);
+    border-radius: 4px;
+    padding: 6px 8px;
+    font-size: 12px;
+    font-family: inherit;
+    resize: vertical;
+    box-sizing: border-box;
+}
+.accept-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+.accept-status {
+    font-size: 11px;
+    color: var(--text-muted);
+}
+.accept-status.ok {
+    color: var(--accent-good, #6c6);
+}
+.accept-status.err {
+    color: var(--error, #c66);
+}
+.accept-mark {
+    color: var(--accent-good, #6c6);
+    font-weight: bold;
+    margin-left: 4px;
 }

@@ -2061,8 +2061,15 @@ function renderFileList() {
             actionsHTML = `<button class="file-process-btn" onclick="event.stopPropagation(); window._processFile('${f.id}')">${f.status === 'done' ? 'Reprocess' : 'Process'}</button>`;
         }
 
+        // T-005-02: small marker beside the filename when the asset's
+        // saved settings diverge from defaults. Server populates
+        // settings_dirty in main.go (scan) and handlers.go (PUT).
+        const dirtyMark = f.settings_dirty
+            ? '<span class="settings-dirty-mark" title="Tuned away from defaults">●</span>'
+            : '';
+
         div.innerHTML = `
-            <div class="filename" title="${f.filename}">${f.filename}</div>
+            <div class="filename" title="${f.filename}">${f.filename}${dirtyMark}</div>
             <div class="file-meta">${metaHTML}</div>
             ${extraHTML}
             ${actionsHTML}
