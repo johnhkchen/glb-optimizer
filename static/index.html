@@ -315,6 +315,18 @@
                 </div>
 
                 <div class="setting-row">
+                    <label>Color calibration mode</label>
+                    <select id="tuneColorCalibrationMode">
+                        <option value="none">none</option>
+                        <option value="from-reference-image">from-reference-image</option>
+                    </select>
+                </div>
+
+                <div class="setting-row" id="referenceImageRow" style="display:none">
+                    <button class="preset-btn" id="tuneReferenceImageBtn">Upload reference image</button>
+                </div>
+
+                <div class="setting-row">
                     <button class="preset-btn" id="tuneResetBtn">Reset to defaults</button>
                 </div>
             </div>

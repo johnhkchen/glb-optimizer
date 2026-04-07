@@ -126,6 +126,8 @@ function makeDefaults() {
         lighting_preset: 'default',
         slice_distribution_mode: 'visual-density',
         ground_align: true,
+        color_calibration_mode: 'none',
+        reference_image_path: '',
     };
 }
 
@@ -278,6 +280,9 @@ const TUNING_SPEC = [
     { field: 'slice_distribution_mode', id: 'tuneSliceDistributionMode', parse: v => v,             fmt: v => v },
     { field: 'ground_align',            id: 'tuneGroundAlign',           parse: v => v === true || v === 'true',
                                                                           fmt: v => String(v) },
+    // T-005-03: color calibration source enum (none / from-reference-image).
+    // The full preset enum lands in S-007.
+    { field: 'color_calibration_mode',  id: 'tuneColorCalibrationMode',  parse: v => v,             fmt: v => v },
 ];
 
 function populateTuningUI() {
@@ -296,6 +301,7 @@ function populateTuningUI() {
         if (valEl) valEl.textContent = spec.fmt(v);
     }
     updateTuningDirty();
+    syncReferenceImageRow();
 }
 
 function wireTuningUI() {
@@ -331,6 +337,18 @@ function wireTuningUI() {
                 new_value: v,
                 ms_since_prev: msSincePrev,
             }, selectedFileId);
+            // T-005-03: when the calibration mode flips, the in-panel
+            // upload row visibility and the live scene need to follow.
+            if (spec.field === 'color_calibration_mode') {
+                syncReferenceImageRow();
+                applyColorCalibration(selectedFileId);
+            }
+        });
+    }
+    const refBtn = document.getElementById('tuneReferenceImageBtn');
+    if (refBtn) {
+        refBtn.addEventListener('click', () => {
+            if (selectedFileId) referenceFileInput.click();
         });
     }
     const resetBtn = document.getElementById('tuneResetBtn');
@@ -340,6 +358,9 @@ function wireTuningUI() {
             applyDefaults();
             populateTuningUI();
             saveSettings(selectedFileId);
+            // T-005-03: defaults set mode back to "none", so any active
+            // calibration on the live scene needs to be torn down.
+            applyColorCalibration(selectedFileId);
         });
     }
 }
@@ -1789,13 +1810,27 @@ async function uploadReferenceImage(id, file) {
 
     try {
         await fetch(`/api/upload-reference/${id}`, { method: 'POST', body: formData });
-        store_update(id, f => { f.has_reference = true; f.reference_ext = file.name.toLowerCase().endsWith('.jpg') ? '.jpg' : '.png'; });
-        await loadReferenceEnvironment(id);
-        // Reload the current model so the new environment takes effect
-        const f = files.find(x => x.id === id);
-        if (f && currentModel) {
-            const url = `/api/preview/${id}?version=${previewVersion}&t=${Date.now()}`;
-            loadModel(url, lastModelSize);
+        const ext = file.name.toLowerCase().endsWith('.jpg') ? '.jpg' : '.png';
+        store_update(id, f => { f.has_reference = true; f.reference_ext = ext; });
+        // T-005-03: persist the path tag in the asset's settings so the
+        // calibration mode has a referent on disk. Only when the upload
+        // is for the currently-selected asset (which is always true via
+        // the toolbar/in-panel button paths, but defensive).
+        if (currentSettings && selectedFileId === id) {
+            currentSettings.reference_image_path = `outputs/${id}_reference${ext}`;
+            saveSettings(id);
+        }
+        // T-005-03: only mutate the live scene when the user has
+        // actually opted into reference-image calibration. Uploading
+        // while mode is "none" stages the image for later but does not
+        // change the current preview.
+        if (currentSettings && currentSettings.color_calibration_mode === 'from-reference-image') {
+            await loadReferenceEnvironment(id);
+            const f = files.find(x => x.id === id);
+            if (f && currentModel) {
+                const url = `/api/preview/${id}?version=${previewVersion}&t=${Date.now()}`;
+                loadModel(url, lastModelSize);
+            }
         }
     } catch (err) {
         console.error('Reference image upload failed:', err);
@@ -2790,21 +2825,66 @@ function selectFile(id) {
     showPreview();
     const file = files.find(f => f.id === id);
     if (file) {
-        // Reset to default environment + neutral lights, then load reference if present
+        // Reset to default environment + neutral lights. T-005-03: the
+        // calibration decision now happens AFTER loadSettings so it can
+        // honor the per-asset color_calibration_mode rather than auto-
+        // applying whenever a reference image happens to exist.
         if (referenceEnvironment) { referenceEnvironment.dispose(); referenceEnvironment = null; }
         referencePalette = null;
         scene.environment = defaultEnvironment;
         resetSceneLights();
-        const loadEnv = file.has_reference
-            ? loadReferenceEnvironment(id)
-            : Promise.resolve();
-        loadEnv.then(async () => {
-            await loadSettings(id);
+        loadSettings(id).then(async () => {
+            if (
+                currentSettings &&
+                currentSettings.color_calibration_mode === 'from-reference-image' &&
+                file.has_reference
+            ) {
+                await loadReferenceEnvironment(id);
+            }
             await startAnalyticsSession(id);
             populateTuningUI();
             populateAcceptedUI(id);
             loadModel(`/api/preview/${id}?version=original&t=${Date.now()}`, file.original_size);
         });
+    }
+}
+
+// T-005-03: hide/show the in-panel "Upload reference image" row based
+// on the current color_calibration_mode.
+function syncReferenceImageRow() {
+    const row = document.getElementById('referenceImageRow');
+    if (!row || !currentSettings) return;
+    row.style.display =
+        currentSettings.color_calibration_mode === 'from-reference-image'
+            ? '' : 'none';
+}
+
+// T-005-03: apply or tear down reference-image color calibration to
+// match the current settings. Idempotent. Used when the user toggles
+// the dropdown after selection (the selection-time path inlines the
+// same gate inside selectFile to avoid an extra model reload).
+function applyColorCalibration(id) {
+    if (!id || !currentSettings) return;
+    const file = files.find(f => f.id === id);
+    const wantCalibration =
+        currentSettings.color_calibration_mode === 'from-reference-image' &&
+        file && file.has_reference;
+    if (wantCalibration) {
+        loadReferenceEnvironment(id).then(() => {
+            if (currentModel) {
+                const url = `/api/preview/${id}?version=${previewVersion}&t=${Date.now()}`;
+                loadModel(url, lastModelSize);
+            }
+        });
+    } else {
+        if (referenceEnvironment) { referenceEnvironment.dispose(); referenceEnvironment = null; }
+        referencePalette = null;
+        scene.environment = defaultEnvironment;
+        resetSceneLights();
+        if (currentModel) {
+            const url = `/api/preview/${id}?version=${previewVersion}&t=${Date.now()}`;
+            loadModel(url, lastModelSize);
+        }
     }
 }
 
