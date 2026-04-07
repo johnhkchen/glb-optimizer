@@ -33,10 +33,9 @@ on unknown fields.
 | `bottom_fill_intensity`  | float   | `0.4`       | `[0.0, 4.0]`                | Intensity of the bottom-fill directional light. |
 | `env_map_intensity`      | float   | `1.2`       | `[0.0, 4.0]`                | Multiplier applied to material `envMapIntensity` in the bake scene. |
 | `alpha_test`             | float   | `0.10`      | `[0.0, 1.0]`                | Alpha test threshold baked into volumetric and billboard quad materials at export time. (Note: a separate runtime override at instance-creation time uses tighter values for billboard/volumetric instances; that is not governed by this field.) |
-| `lighting_preset`        | string  | `"default"` | `{"default", "midday-sun", "overcast", "golden-hour", "dusk", "indoor"}` | Named lighting preset (T-007-01). Picking a preset overwrites the dependent intensity fields (`ambient_intensity`, `hemisphere_intensity`, `key_light_intensity`, `bottom_fill_intensity`, `env_map_intensity`, `bake_exposure`) and supplies the colors used by the bake pipeline. Full preset definitions live in `static/presets/lighting.js`; the backend only validates membership. |
+| `lighting_preset`        | string  | `"default"` | `{"default", "midday-sun", "overcast", "golden-hour", "dusk", "indoor", "from-reference-image"}` | Named lighting preset (T-007-01, T-007-03). Picking a preset overwrites the dependent intensity fields (`ambient_intensity`, `hemisphere_intensity`, `key_light_intensity`, `bottom_fill_intensity`, `env_map_intensity`, `bake_exposure`) and supplies the colors used by the bake pipeline. The `from-reference-image` preset (T-007-03) is special: when selected and the asset has an uploaded reference image, the bake/preview palette is derived from the image's dominant colors via the existing palette extraction; without an image its `bake_config` is a neutral baseline. Full preset definitions live in `static/presets/lighting.js`; the backend only validates membership. |
 | `slice_distribution_mode`| string  | `"visual-density"` | `{"equal-height","vertex-quantile","visual-density"}` | How `renderHorizontalLayerGLB` places per-slice Y boundaries. `equal-height` = linear interpolation across the bounding box (legacy simple slicing). `vertex-quantile` = legacy adaptive picker; boundaries fall at vertex-count quantiles. `visual-density` = trunk-filtered, radial-weighted quantile that biases boundaries toward visible foliage rather than dense lower geometry (T-005-01). |
 | `ground_align`           | bool    | `true`      | `true` / `false`            | When true, the volumetric export scene is translated so the bottom slice's floor sits exactly at `Y=0`, preventing leaves from clipping into the scene preview ground (T-005-01). |
-| `color_calibration_mode` | string  | `"none"`    | `{"none","from-reference-image"}` | Color calibration source. `none` = neutral lighting (default). `from-reference-image` = use the per-asset reference image to derive a tinted environment + bake lights via the existing palette extraction (T-005-03). The full preset enum lands in S-007. |
 | `reference_image_path`   | string  | `""`        | free string                 | Optional tag pointing to the asset's reference image on disk (e.g. `outputs/{id}_reference.png`). Set automatically by the client after a successful upload to `/api/upload-reference/:id`. Not dereferenced server-side; the image is served by `/api/reference/:id` (T-005-03). |
 
 Numeric ranges are intentionally permissive — they exist to catch typos and
@@ -60,8 +59,7 @@ NaN/infinity, not to enforce taste. UI sliders (T-002-03) will set tighter
   "alpha_test": 0.10,
   "lighting_preset": "default",
   "slice_distribution_mode": "visual-density",
-  "ground_align": true,
-  "color_calibration_mode": "none"
+  "ground_align": true
 }
 ```
 
@@ -122,6 +120,14 @@ and *before* `Validate` for these cases:
   from "absent" the loader re-decodes the same byte slice into a tiny
   struct with `*bool` so `nil` means "no key on disk". An explicit
   `"ground_align": false` is preserved.
+- `color_calibration_mode` → `lighting_preset` (T-007-03): the legacy
+  T-005-03 field has been removed from `AssetSettings`. On load, if a
+  document still carries `"color_calibration_mode": "from-reference-image"`
+  AND the explicit `lighting_preset` is the bare default `"default"`,
+  the loader rewrites `lighting_preset` to `"from-reference-image"`.
+  An explicit non-default preset is treated as a user override and
+  wins. The same `*pointer` re-decode trick is used so a key that is
+  absent vs. present-but-empty can be distinguished.
 
 These normalizations are **not** schema-version bumps; the on-disk
 shape is unchanged for any document that already includes the keys.

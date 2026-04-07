@@ -74,8 +74,6 @@ func TestValidate_RejectsOutOfRange(t *testing.T) {
 		{"unknown preset", func(s *AssetSettings) { s.LightingPreset = "studio" }},
 		{"empty slice mode", func(s *AssetSettings) { s.SliceDistributionMode = "" }},
 		{"unknown slice mode", func(s *AssetSettings) { s.SliceDistributionMode = "spirals" }},
-		{"empty calibration mode", func(s *AssetSettings) { s.ColorCalibrationMode = "" }},
-		{"unknown calibration mode", func(s *AssetSettings) { s.ColorCalibrationMode = "preset-x" }},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -220,7 +218,7 @@ func TestSettingsDifferFromDefaults(t *testing.T) {
 			{"key_light_intensity", func(s *AssetSettings) { s.KeyLightIntensity = 2.0 }},
 			{"ground_align", func(s *AssetSettings) { s.GroundAlign = false }},
 			{"slice_distribution_mode", func(s *AssetSettings) { s.SliceDistributionMode = "equal-height" }},
-			{"color_calibration_mode", func(s *AssetSettings) { s.ColorCalibrationMode = "from-reference-image" }},
+			{"lighting_preset", func(s *AssetSettings) { s.LightingPreset = "from-reference-image" }},
 			{"reference_image_path", func(s *AssetSettings) { s.ReferenceImagePath = "outputs/x_reference.png" }},
 		}
 		for _, c := range cases {
@@ -243,10 +241,12 @@ func TestSettingsDifferFromDefaults(t *testing.T) {
 	})
 }
 
-// TestLoadSettings_NormalizesColorCalibrationMode asserts that a
-// pre-T-005-03 document with no color_calibration_mode key loads with
-// the new field defaulted to "none" and validates cleanly.
-func TestLoadSettings_NormalizesColorCalibrationMode(t *testing.T) {
+// TestLoadSettings_MigratesColorCalibrationMode asserts that a
+// pre-T-007-03 document carrying the legacy
+// `color_calibration_mode: "from-reference-image"` key (with the
+// default lighting preset) is migrated to
+// `lighting_preset: "from-reference-image"` on load.
+func TestLoadSettings_MigratesColorCalibrationMode(t *testing.T) {
 	dir := t.TempDir()
 	id := "legacy-cal"
 	doc := `{
@@ -263,7 +263,8 @@ func TestLoadSettings_NormalizesColorCalibrationMode(t *testing.T) {
   "alpha_test": 0.10,
   "lighting_preset": "default",
   "slice_distribution_mode": "visual-density",
-  "ground_align": true
+  "ground_align": true,
+  "color_calibration_mode": "from-reference-image"
 }
 `
 	path := filepath.Join(dir, id+".json")
@@ -274,14 +275,52 @@ func TestLoadSettings_NormalizesColorCalibrationMode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadSettings: %v", err)
 	}
-	if loaded.ColorCalibrationMode != "none" {
-		t.Errorf("ColorCalibrationMode = %q, want %q", loaded.ColorCalibrationMode, "none")
-	}
-	if loaded.ReferenceImagePath != "" {
-		t.Errorf("ReferenceImagePath = %q, want empty", loaded.ReferenceImagePath)
+	if loaded.LightingPreset != "from-reference-image" {
+		t.Errorf("LightingPreset = %q, want %q", loaded.LightingPreset, "from-reference-image")
 	}
 	if err := loaded.Validate(); err != nil {
-		t.Errorf("normalized doc failed validation: %v", err)
+		t.Errorf("migrated doc failed validation: %v", err)
+	}
+}
+
+// TestLoadSettings_ExplicitPresetWinsOverLegacyMode asserts that an
+// explicit non-default `lighting_preset` is preserved when a legacy
+// `color_calibration_mode: from-reference-image` key is also present —
+// the user has already chosen a preset and that choice wins.
+func TestLoadSettings_ExplicitPresetWinsOverLegacyMode(t *testing.T) {
+	dir := t.TempDir()
+	id := "explicit-preset"
+	doc := `{
+  "schema_version": 1,
+  "volumetric_layers": 4,
+  "volumetric_resolution": 512,
+  "dome_height_factor": 0.5,
+  "bake_exposure": 1.0,
+  "ambient_intensity": 0.5,
+  "hemisphere_intensity": 1.0,
+  "key_light_intensity": 1.4,
+  "bottom_fill_intensity": 0.4,
+  "env_map_intensity": 1.2,
+  "alpha_test": 0.10,
+  "lighting_preset": "midday-sun",
+  "slice_distribution_mode": "visual-density",
+  "ground_align": true,
+  "color_calibration_mode": "from-reference-image"
+}
+`
+	path := filepath.Join(dir, id+".json")
+	if err := os.WriteFile(path, []byte(doc), 0644); err != nil {
+		t.Fatalf("write doc: %v", err)
+	}
+	loaded, err := LoadSettings(id, dir)
+	if err != nil {
+		t.Fatalf("LoadSettings: %v", err)
+	}
+	if loaded.LightingPreset != "midday-sun" {
+		t.Errorf("LightingPreset = %q, want %q (explicit must win)", loaded.LightingPreset, "midday-sun")
+	}
+	if err := loaded.Validate(); err != nil {
+		t.Errorf("doc failed validation: %v", err)
 	}
 }
 
