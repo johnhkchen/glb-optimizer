@@ -37,6 +37,9 @@ on unknown fields.
 | `slice_distribution_mode`| string  | `"visual-density"` | `{"equal-height","vertex-quantile","visual-density"}` | How `renderHorizontalLayerGLB` places per-slice Y boundaries. `equal-height` = linear interpolation across the bounding box (legacy simple slicing). `vertex-quantile` = legacy adaptive picker; boundaries fall at vertex-count quantiles. `visual-density` = trunk-filtered, radial-weighted quantile that biases boundaries toward visible foliage rather than dense lower geometry (T-005-01). |
 | `ground_align`           | bool    | `true`      | `true` / `false`            | When true, the volumetric export scene is translated so the bottom slice's floor sits exactly at `Y=0`, preventing leaves from clipping into the scene preview ground (T-005-01). |
 | `reference_image_path`   | string  | `""`        | free string                 | Optional tag pointing to the asset's reference image on disk (e.g. `outputs/{id}_reference.png`). Set automatically by the client after a successful upload to `/api/upload-reference/:id`. Not dereferenced server-side; the image is served by `/api/reference/:id` (T-005-03). |
+| `shape_category`         | string  | `"unknown"` | `{"round-bush","directional","tall-narrow","planar","hard-surface","unknown"}` | S-004 shape taxonomy class returned by the Python classifier (T-004-02). Populated by `POST /api/classify/:id` and auto-classified on upload — not user-editable. T-004-03's strategy router reads this field; `"unknown"` means "use the default strategy". |
+| `shape_confidence`       | float   | `0`         | `[0.0, 1.0]`                | Classifier softmax confidence for `shape_category`. T-004-04's multi-strategy comparison UI fires when this drops below `0.7`. The value `1.0` is reserved as the human-confirmed sentinel: it is set by the override path of `POST /api/classify/:id?override=<category>` and tells the frontend's `selectFile` not to re-prompt the user with the comparison modal on subsequent selections. |
+| `slice_axis`             | string  | `"y"`       | `{"y","auto-horizontal","auto-thin"}` | Bake-time slice axis chosen by the S-004 strategy router (T-004-03). `y` = literal vertical axis (legacy behavior, used by `round-bush` / `tall-narrow` / `unknown` / `hard-surface`). `auto-horizontal` = whichever of X/Z is the longer extent (used by `directional`). `auto-thin` = whichever bounding-box axis is shortest (used by `planar`). Stamped by `applyClassificationToSettings` only when the asset's value is still at the default; user overrides survive re-classification. Documents written before T-004-03 with no `slice_axis` key are normalized to `"y"` at load time. |
 
 Numeric ranges are intentionally permissive — they exist to catch typos and
 NaN/infinity, not to enforce taste. UI sliders (T-002-03) will set tighter
@@ -120,6 +123,10 @@ and *before* `Validate` for these cases:
   from "absent" the loader re-decodes the same byte slice into a tiny
   struct with `*bool` so `nil` means "no key on disk". An explicit
   `"ground_align": false` is preserved.
+- `shape_category` (T-004-02): empty string (key absent) → `"unknown"`.
+  Old documents written before the classifier landed have no
+  `shape_category` key; the empty Go zero would otherwise fail enum
+  validation. `"unknown"` is also the `DefaultSettings()` value.
 - `color_calibration_mode` → `lighting_preset` (T-007-03): the legacy
   T-005-03 field has been removed from `AssetSettings`. On load, if a
   document still carries `"color_calibration_mode": "from-reference-image"`
