@@ -385,6 +385,15 @@ body {
     color: #e87d0d;
 }
 
+/* T-007-02: stale-bake hint shown when the user has changed the
+   lighting preset since the last successful regenerate. */
+.bake-stale-hint {
+    color: #f5b942;
+    font-size: 12px;
+    padding: 0 8px;
+    align-self: center;
+}
+
 .toolbar-btn-blender:hover:not(:disabled) {
     border-color: #ff8c1a;
     color: #ff8c1a;

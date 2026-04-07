@@ -57,6 +57,7 @@
                     <button class="toolbar-btn" id="generateVolumetricBtn" disabled>Volumetric</button>
                     <button class="toolbar-btn" id="generateVolumetricLodsBtn" disabled>Vol LODs</button>
                     <button class="toolbar-btn" id="generateProductionBtn" disabled title="Generate billboard + volumetric hybrid asset">Production Asset</button>
+                    <span id="bakeStaleHint" class="bake-stale-hint" style="display:none" title="The on-disk baked textures still reflect the previous lighting preset. Regenerate to apply the new preset.">Bake out of date — regenerate to apply preset</span>
                     <button class="toolbar-btn" id="uploadReferenceBtn" disabled title="Upload a reference image to calibrate scene lighting">Reference Image</button>
                     <input type="file" id="referenceFileInput" accept="image/png,image/jpeg" hidden>
                     <button class="toolbar-btn" id="testLightingBtn" disabled title="Diagnostic: render a test scene and report pixel brightness">Test Lighting</button>
