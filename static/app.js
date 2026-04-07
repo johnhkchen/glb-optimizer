@@ -971,8 +971,35 @@ function renderBillboardAngle(model, angleRad, resolution) {
     return { canvas: copyCanvas, quadWidth: halfW * 2, quadHeight: halfH * 2, center, boxMinY: box.min.y };
 }
 
+// T-007-01: Resolve the active bake palette in priority order:
+//   1. referencePalette — explicit user calibration always wins.
+//   2. Active lighting preset's bake_config colors.
+//   3. Neutral white/dark fallback (the legacy default).
+// Returns a {bright, mid, dark} object using {r,g,b} 0..1 components,
+// matching the shape setupBakeLights and renderLayerTopDown already use.
+function getActiveBakePalette() {
+    if (referencePalette) return referencePalette;
+    const id = currentSettings && currentSettings.lighting_preset;
+    const preset = getLightingPreset(id) || getLightingPreset('default');
+    if (!preset) {
+        return {
+            bright: { r: 1, g: 1, b: 1 },
+            mid:    { r: 1, g: 1, b: 1 },
+            dark:   { r: 0.27, g: 0.27, b: 0.27 },
+        };
+    }
+    const bc = preset.bake_config;
+    const tup = ([r, g, b]) => ({ r, g, b });
+    return {
+        bright: tup(bc.hemisphere_sky),
+        mid:    tup(bc.key_color),
+        dark:   tup(bc.hemisphere_ground),
+    };
+}
+
 // Add bake lights to an offscreen scene. Tinted by the reference palette if
-// one is loaded. The offscreen scene also gets its own PMREM env (see
+// one is loaded, otherwise by the active lighting preset (T-007-01).
+// The offscreen scene also gets its own PMREM env (see
 // createBakeEnvironment) so PBR materials have IBL — these direct lights
 // supply the highlights and shadows on top.
 // Omnidirectional bake lighting — rotationally symmetric around the Y axis so
@@ -980,15 +1007,10 @@ function renderBillboardAngle(model, angleRad, resolution) {
 // lights. Palette colors are used as TINTS (near-white normalized colors), so
 // light intensities can stay high without darkening.
 function setupBakeLights(offScene) {
-    const sky = referencePalette
-        ? new THREE.Color(referencePalette.bright.r, referencePalette.bright.g, referencePalette.bright.b)
-        : new THREE.Color(0xffffff);
-    const fill = referencePalette
-        ? new THREE.Color(referencePalette.mid.r, referencePalette.mid.g, referencePalette.mid.b)
-        : new THREE.Color(0xffffff);
-    const ground = referencePalette
-        ? new THREE.Color(referencePalette.dark.r, referencePalette.dark.g, referencePalette.dark.b)
-        : new THREE.Color(0x444444);
+    const palette = getActiveBakePalette();
+    const sky    = new THREE.Color(palette.bright.r, palette.bright.g, palette.bright.b);
+    const fill   = new THREE.Color(palette.mid.r,    palette.mid.g,    palette.mid.b);
+    const ground = new THREE.Color(palette.dark.r,   palette.dark.g,   palette.dark.b);
 
     offScene.add(new THREE.AmbientLight(sky, currentSettings.ambient_intensity));
     // Hemisphere light gives top→bottom color gradient without horizontal bias
@@ -1003,38 +1025,63 @@ function setupBakeLights(offScene) {
     offScene.add(dlBottom);
 }
 
+// Build a vertical-gradient equirectangular env texture from three RGB
+// stops (top, mid, bottom). Each stop is either {r,g,b} 0..1 or [r,g,b].
+// Used by createBakeEnvironment for both the reference-palette path and
+// the active-preset path (T-007-01).
+function buildGradientEnvTexture(stops, pmrem) {
+    const norm = (s) => Array.isArray(s) ? { r: s[0], g: s[1], b: s[2] } : s;
+    const top = norm(stops[0]);
+    const mid = norm(stops[1]);
+    const bot = norm(stops[2]);
+    const w = 256, h = 128;
+    const cv = document.createElement('canvas');
+    cv.width = w; cv.height = h;
+    const ctx = cv.getContext('2d');
+    const grad = ctx.createLinearGradient(0, 0, 0, h);
+    const c = (col) => `rgb(${Math.round(col.r * 255)},${Math.round(col.g * 255)},${Math.round(col.b * 255)})`;
+    grad.addColorStop(0,   c(top));
+    grad.addColorStop(0.5, c(mid));
+    grad.addColorStop(1,   c(bot));
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, w, h);
+
+    const tex = new THREE.CanvasTexture(cv);
+    tex.mapping = THREE.EquirectangularReflectionMapping;
+    tex.colorSpace = THREE.SRGBColorSpace;
+    tex.needsUpdate = true;
+    const env = pmrem.fromEquirectangular(tex).texture;
+    tex.dispose();
+    return env;
+}
+
 // Build a PMREM environment map ON THE GIVEN RENDERER. This is the key fix
 // for the bake — we can't reuse the main renderer's PMREM texture in an
 // offscreen context, so each offscreen render generates its own env using
-// its own PMREMGenerator. Tinted by the reference palette if loaded.
+// its own PMREMGenerator. Source priority (T-007-01):
+//   1. Reference palette if loaded.
+//   2. Active lighting preset's env_gradient (skipped for 'default' so
+//      the legacy RoomEnvironment is preserved as the neutral baseline).
+//   3. RoomEnvironment fallback.
 function createBakeEnvironment(renderer) {
     const pmrem = new THREE.PMREMGenerator(renderer);
     pmrem.compileEquirectangularShader();
 
     let env;
     if (referencePalette) {
-        // Same gradient trick as the live preview env: bright→mid→dark
-        const w = 256, h = 128;
-        const cv = document.createElement('canvas');
-        cv.width = w; cv.height = h;
-        const ctx = cv.getContext('2d');
-        const grad = ctx.createLinearGradient(0, 0, 0, h);
-        const c = (col) => `rgb(${Math.round(col.r * 255)},${Math.round(col.g * 255)},${Math.round(col.b * 255)})`;
-        grad.addColorStop(0, c(referencePalette.bright));
-        grad.addColorStop(0.5, c(referencePalette.mid));
-        grad.addColorStop(1, c(referencePalette.dark));
-        ctx.fillStyle = grad;
-        ctx.fillRect(0, 0, w, h);
-
-        const tex = new THREE.CanvasTexture(cv);
-        tex.mapping = THREE.EquirectangularReflectionMapping;
-        tex.colorSpace = THREE.SRGBColorSpace;
-        tex.needsUpdate = true;
-        env = pmrem.fromEquirectangular(tex).texture;
-        tex.dispose();
+        env = buildGradientEnvTexture(
+            [referencePalette.bright, referencePalette.mid, referencePalette.dark],
+            pmrem,
+        );
     } else {
-        // Neutral default: RoomEnvironment, generated on this renderer
-        env = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+        const presetId = currentSettings && currentSettings.lighting_preset;
+        const preset = getLightingPreset(presetId);
+        if (preset && preset.id !== 'default' && preset.bake_config.env_gradient) {
+            env = buildGradientEnvTexture(preset.bake_config.env_gradient, pmrem);
+        } else {
+            // Neutral default: RoomEnvironment, generated on this renderer
+            env = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+        }
     }
 
     pmrem.dispose();
@@ -1238,17 +1285,11 @@ function renderLayerTopDown(model, resolution, floorY, ceilingY) {
     const bakeEnv = createBakeEnvironment(offRenderer);
     offScene.environment = bakeEnv;
 
-    // Tinted by reference palette if loaded. Palette colors are normalized
-    // tints near 1.0, so we can use bright intensities without darkening.
-    const sky = referencePalette
-        ? new THREE.Color(referencePalette.bright.r, referencePalette.bright.g, referencePalette.bright.b)
-        : new THREE.Color(0xffffff);
-    const fill = referencePalette
-        ? new THREE.Color(referencePalette.mid.r, referencePalette.mid.g, referencePalette.mid.b)
-        : new THREE.Color(0xffffff);
-    const ground = referencePalette
-        ? new THREE.Color(referencePalette.dark.r, referencePalette.dark.g, referencePalette.dark.b)
-        : new THREE.Color(0x444444);
+    // T-007-01: same active palette resolution as setupBakeLights.
+    const palette = getActiveBakePalette();
+    const sky    = new THREE.Color(palette.bright.r, palette.bright.g, palette.bright.b);
+    const fill   = new THREE.Color(palette.mid.r,    palette.mid.g,    palette.mid.b);
+    const ground = new THREE.Color(palette.dark.r,   palette.dark.g,   palette.dark.b);
     // Omni: ambient + hemisphere + pure top-down key. No side-biased lights so
     // each layer renders symmetrically.
     offScene.add(new THREE.AmbientLight(sky, currentSettings.ambient_intensity));
