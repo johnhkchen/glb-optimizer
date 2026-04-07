@@ -133,7 +133,6 @@ function makeDefaults() {
         lighting_preset: 'default',
         slice_distribution_mode: 'visual-density',
         ground_align: true,
-        color_calibration_mode: 'none',
         reference_image_path: '',
     };
 }
@@ -346,9 +345,6 @@ const TUNING_SPEC = [
     { field: 'slice_distribution_mode', id: 'tuneSliceDistributionMode', parse: v => v,             fmt: v => v },
     { field: 'ground_align',            id: 'tuneGroundAlign',           parse: v => v === true || v === 'true',
                                                                           fmt: v => String(v) },
-    // T-005-03: color calibration source enum (none / from-reference-image).
-    // The full preset enum lands in S-007.
-    { field: 'color_calibration_mode',  id: 'tuneColorCalibrationMode',  parse: v => v,             fmt: v => v },
 ];
 
 function populateTuningUI() {
@@ -412,12 +408,6 @@ function wireTuningUI() {
                 new_value: v,
                 ms_since_prev: msSincePrev,
             }, selectedFileId);
-            // T-005-03: when the calibration mode flips, the in-panel
-            // upload row visibility and the live scene need to follow.
-            if (spec.field === 'color_calibration_mode') {
-                syncReferenceImageRow();
-                applyColorCalibration(selectedFileId);
-            }
         });
     }
     const refBtn = document.getElementById('tuneReferenceImageBtn');
@@ -430,12 +420,14 @@ function wireTuningUI() {
     if (resetBtn) {
         resetBtn.addEventListener('click', () => {
             if (!selectedFileId) return;
+            // T-007-03: route reset through applyLightingPreset so it
+            // tears down any active reference-image calibration AND
+            // refreshes the live scene + bake-stale hint via the same
+            // cascade a manual preset pick uses. applyDefaults() seeds
+            // currentSettings; applyLightingPreset('default') then
+            // rewrites sliders, saves, and emits preset_applied.
             applyDefaults();
-            populateTuningUI();
-            saveSettings(selectedFileId);
-            // T-005-03: defaults set mode back to "none", so any active
-            // calibration on the live scene needs to be torn down.
-            applyColorCalibration(selectedFileId);
+            applyLightingPreset('default');
         });
     }
 }
