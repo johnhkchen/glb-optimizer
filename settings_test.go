@@ -88,6 +88,30 @@ func TestValidate_RejectsOutOfRange(t *testing.T) {
 	}
 }
 
+// TestValidate_AcceptsAllPresets ensures every id named in
+// validLightingPresets passes Validate(). T-007-01 grew this enum from
+// {default} to a 6-value set; this guards against accidentally dropping
+// one of the new ids.
+func TestValidate_AcceptsAllPresets(t *testing.T) {
+	ids := []string{
+		"default",
+		"midday-sun",
+		"overcast",
+		"golden-hour",
+		"dusk",
+		"indoor",
+	}
+	for _, id := range ids {
+		t.Run(id, func(t *testing.T) {
+			s := DefaultSettings()
+			s.LightingPreset = id
+			if err := s.Validate(); err != nil {
+				t.Errorf("preset %q rejected: %v", id, err)
+			}
+		})
+	}
+}
+
 func TestDefaultSettings_NewFields(t *testing.T) {
 	s := DefaultSettings()
 	if s.SliceDistributionMode != "visual-density" {

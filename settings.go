@@ -66,9 +66,17 @@ var validResolutions = map[int]bool{
 	128: true, 256: true, 512: true, 1024: true, 2048: true,
 }
 
-// validLightingPresets is the v1 set. S-007 will extend this.
+// validLightingPresets enumerates the named lighting presets exposed
+// in the tuning panel. The full preset definitions (colors, intensities,
+// env gradient) live in static/presets/lighting.js — the backend only
+// validates that the id is one of the known set. Added in T-007-01.
 var validLightingPresets = map[string]bool{
-	"default": true,
+	"default":     true,
+	"midday-sun":  true,
+	"overcast":    true,
+	"golden-hour": true,
+	"dusk":        true,
+	"indoor":      true,
 }
 
 // validSliceDistributionModes enumerates the allowed values for
