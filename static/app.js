@@ -2224,19 +2224,31 @@ function buildSyntheticEnvironment(palette) {
     scene.environment = referenceEnvironment;
 }
 
-// Tint the scene's ambient + hemisphere lights with the reference palette so
-// direct lighting also picks up the calibrated colors.
+// Tint the scene's lights with the reference palette so direct
+// lighting picks up the calibrated colors. T-007-02: extended to
+// also tint the three DirectionalLights — without this, the live
+// preview's diffuse highlights stayed neutral white even when the
+// reference image had clearly warm or cool colors. Existing
+// directional intensities are left intact.
 function applyReferenceTint(palette) {
     const sky = new THREE.Color(palette.bright.r, palette.bright.g, palette.bright.b);
-    const ground = new THREE.Color(palette.mid.r, palette.mid.g, palette.mid.b);
+    const mid = new THREE.Color(palette.mid.r, palette.mid.g, palette.mid.b);
     scene.traverse((obj) => {
         if (obj.isHemisphereLight) {
             obj.color.copy(sky);
-            obj.groundColor.copy(ground);
+            obj.groundColor.copy(mid);
             obj.intensity = 1.0;
         } else if (obj.isAmbientLight) {
             obj.color.copy(sky);
             obj.intensity = 0.6;
+        } else if (obj.isDirectionalLight) {
+            if (obj.position.y < 0) {
+                // Under-fill: warmer mid tone.
+                obj.color.copy(mid);
+            } else {
+                // Key + back/rim: bright sky tone.
+                obj.color.copy(sky);
+            }
         }
     });
 }
