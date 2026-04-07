@@ -186,6 +186,14 @@ function applyLightingPreset(id) {
     // on-disk bake as stale until the user regenerates.
     applyPresetToLiveScene();
     setBakeStale(true);
+    // T-007-03: the `from-reference-image` preset id is the new
+    // discriminator for reference-image calibration. Picking it (or
+    // switching away from it) drives the same loadReferenceEnvironment
+    // / tear-down branch that the legacy color_calibration_mode toggle
+    // used to call. applyColorCalibration is idempotent and safe on
+    // assets without an uploaded image — it just falls through to the
+    // tear-down branch in that case.
+    if (selectedFileId) applyColorCalibration(selectedFileId);
     if (selectedFileId) saveSettings(selectedFileId);
     logEvent('preset_applied', {
         from: before.lighting_preset,
@@ -2026,7 +2034,7 @@ async function uploadReferenceImage(id, file) {
         // actually opted into reference-image calibration. Uploading
         // while mode is "none" stages the image for later but does not
         // change the current preview.
-        if (currentSettings && currentSettings.color_calibration_mode === 'from-reference-image') {
+        if (currentSettings && currentSettings.lighting_preset === 'from-reference-image') {
             await loadReferenceEnvironment(id);
             const f = files.find(x => x.id === id);
             if (f && currentModel) {
@@ -3050,7 +3058,7 @@ function selectFile(id) {
         loadSettings(id).then(async () => {
             if (
                 currentSettings &&
-                currentSettings.color_calibration_mode === 'from-reference-image' &&
+                currentSettings.lighting_preset === 'from-reference-image' &&
                 file.has_reference
             ) {
                 await loadReferenceEnvironment(id);
@@ -3067,13 +3075,14 @@ function selectFile(id) {
     }
 }
 
-// T-005-03: hide/show the in-panel "Upload reference image" row based
-// on the current color_calibration_mode.
+// T-005-03 / T-007-03: hide/show the in-panel "Upload reference image"
+// row based on whether the active lighting preset is the
+// `from-reference-image` calibration preset.
 function syncReferenceImageRow() {
     const row = document.getElementById('referenceImageRow');
     if (!row || !currentSettings) return;
     row.style.display =
-        currentSettings.color_calibration_mode === 'from-reference-image'
+        currentSettings.lighting_preset === 'from-reference-image'
             ? '' : 'none';
 }
 
@@ -3085,7 +3094,7 @@ function applyColorCalibration(id) {
     if (!id || !currentSettings) return;
     const file = files.find(f => f.id === id);
     const wantCalibration =
-        currentSettings.color_calibration_mode === 'from-reference-image' &&
+        currentSettings.lighting_preset === 'from-reference-image' &&
         file && file.has_reference;
     if (wantCalibration) {
         loadReferenceEnvironment(id).then(() => {
