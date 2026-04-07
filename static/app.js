@@ -971,12 +971,30 @@ function renderBillboardAngle(model, angleRad, resolution) {
     return { canvas: copyCanvas, quadWidth: halfW * 2, quadHeight: halfH * 2, center, boxMinY: box.min.y };
 }
 
+// T-007-02: Pure helper. Given a preset config object (bake_config or
+// preview_config), return the {bright, mid, dark, key, fill} palette
+// the light-setup helpers consume. Reused by getActiveBakePalette and
+// getActivePreviewPalette so the tuple-to-object dance lives in one
+// place.
+function resolvePresetColors(cfg) {
+    const tup = ([r, g, b]) => ({ r, g, b });
+    return {
+        bright: tup(cfg.hemisphere_sky),
+        mid:    tup(cfg.key_color),
+        dark:   tup(cfg.hemisphere_ground),
+        key:    tup(cfg.key_color),
+        fill:   tup(cfg.fill_color),
+    };
+}
+
 // T-007-01: Resolve the active bake palette in priority order:
 //   1. referencePalette — explicit user calibration always wins.
 //   2. Active lighting preset's bake_config colors.
 //   3. Neutral white/dark fallback (the legacy default).
 // Returns a {bright, mid, dark} object using {r,g,b} 0..1 components,
 // matching the shape setupBakeLights and renderLayerTopDown already use.
+// (T-007-02: also returns key/fill for parity with getActivePreviewPalette;
+// existing bake call sites simply ignore those fields.)
 function getActiveBakePalette() {
     if (referencePalette) return referencePalette;
     const id = currentSettings && currentSettings.lighting_preset;
@@ -986,15 +1004,11 @@ function getActiveBakePalette() {
             bright: { r: 1, g: 1, b: 1 },
             mid:    { r: 1, g: 1, b: 1 },
             dark:   { r: 0.27, g: 0.27, b: 0.27 },
+            key:    { r: 1, g: 1, b: 1 },
+            fill:   { r: 1, g: 1, b: 1 },
         };
     }
-    const bc = preset.bake_config;
-    const tup = ([r, g, b]) => ({ r, g, b });
-    return {
-        bright: tup(bc.hemisphere_sky),
-        mid:    tup(bc.key_color),
-        dark:   tup(bc.hemisphere_ground),
-    };
+    return resolvePresetColors(preset.bake_config);
 }
 
 // Add bake lights to an offscreen scene. Tinted by the reference palette if
