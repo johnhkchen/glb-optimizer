@@ -132,6 +132,7 @@ function makeDefaults() {
         alpha_test: 0.10,
         lighting_preset: 'default',
         slice_distribution_mode: 'visual-density',
+        slice_axis: 'y',
         ground_align: true,
         reference_image_path: '',
     };
@@ -322,6 +323,290 @@ window.endAnalyticsSession = endAnalyticsSession;
 window.endAnalyticsSessionBeacon = endAnalyticsSessionBeacon;
 window.logEvent = logEvent;
 
+// ── T-004-04: Multi-strategy comparison UI ──
+//
+// When the classifier (T-004-02) returns confidence < 0.7, or when the
+// user clicks "Reclassify…" in the tuning panel, we open a modal that
+// renders the asset under 2-3 candidate strategies side-by-side. The
+// user's pick is the most valuable training signal in S-004 — every
+// resolved comparison becomes a labeled training example linking
+// (asset features → human-preferred strategy).
+//
+// The candidate ranking comes from the classifier's
+// `features.candidates` field (Python side) and round-trips through
+// the /api/classify response. Picks are POSTed back as
+// /api/classify/:id?override=<category>; the Go side stamps the
+// strategy and emits a `classification_override` analytics event.
+//
+// The auto-confidence threshold and the human-confirmed sentinel
+// (1.0) are documented in docs/knowledge/settings-schema.md under
+// shape_confidence.
+
+// JS-side mirror of strategy.go's shapeStrategyTable. Kept in sync by
+// hand — same staleness risk as the existing Python ↔ Go duplication
+// of validShapeCategories. Used by renderCandidateThumbnail to
+// temporarily mutate currentSettings before each candidate bake.
+const STRATEGY_TABLE = {
+    'round-bush':   { slice_axis: 'y',               slice_distribution_mode: 'visual-density', volumetric_layers: 4 },
+    'directional':  { slice_axis: 'auto-horizontal', slice_distribution_mode: 'equal-height',   volumetric_layers: 4 },
+    'tall-narrow':  { slice_axis: 'y',               slice_distribution_mode: 'equal-height',   volumetric_layers: 6 },
+    'planar':       { slice_axis: 'auto-thin',       slice_distribution_mode: 'equal-height',   volumetric_layers: 3 },
+    'hard-surface': { slice_axis: 'n/a',             slice_distribution_mode: 'n/a',             volumetric_layers: 0 },
+    'unknown':      { slice_axis: 'y',               slice_distribution_mode: 'visual-density', volumetric_layers: 4 },
+};
+
+const COMPARISON_THUMB_SIZE = 256;
+const COMPARISON_AUTO_THRESHOLD = 0.7;
+
+// fetchClassification calls POST /api/classify/:id with an optional
+// override category. Returns {settings, candidates}; throws on HTTP
+// failure. Single source of truth for the endpoint shape.
+async function fetchClassification(id, overrideCategory) {
+    const url = overrideCategory
+        ? `/api/classify/${id}?override=${encodeURIComponent(overrideCategory)}`
+        : `/api/classify/${id}`;
+    const res = await fetch(url, { method: 'POST' });
+    if (!res.ok) {
+        const text = await res.text().catch(() => '');
+        throw new Error(`POST ${url} → ${res.status}: ${text}`);
+    }
+    return await res.json();
+}
+
+// openComparisonModal builds the slot DOM (one per candidate, capped
+// at 3) and sequentially renders each thumbnail. Closing the modal
+// without a pick is allowed — the asset's classifier-derived state is
+// preserved and the auto-open will fire again next time.
+async function openComparisonModal(id, candidates, originalCategory, originalConfidence) {
+    if (!Array.isArray(candidates) || candidates.length === 0) return;
+    if (!currentModel) {
+        // The model hasn't loaded yet — no point rendering thumbnails.
+        // Caller is responsible for sequencing this after loadModel.
+        console.warn('openComparisonModal: no currentModel, skipping');
+        return;
+    }
+    const modal = document.getElementById('comparisonModal');
+    const slotsEl = document.getElementById('comparisonSlots');
+    const subtitle = document.getElementById('comparisonSubtitle');
+    const errEl = document.getElementById('comparisonError');
+    if (!modal || !slotsEl) return;
+
+    modal.dataset.assetId = id;
+    modal.dataset.originalCategory = originalCategory || '';
+    modal.dataset.originalConfidence = String(originalConfidence ?? 0);
+    if (errEl) errEl.textContent = '';
+    if (subtitle) {
+        const confTxt = (originalConfidence != null && originalConfidence > 0)
+            ? ` (classifier picked ${originalCategory} @ ${originalConfidence.toFixed(2)})`
+            : '';
+        subtitle.textContent = `Pick how this asset should be processed${confTxt}.`;
+    }
+
+    // Build slots up front so the user sees the layout immediately.
+    slotsEl.innerHTML = '';
+    const top = candidates.slice(0, 3);
+    const slotEls = top.map((cand) => {
+        const slot = document.createElement('div');
+        slot.className = 'comparison-slot';
+        const thumb = document.createElement('div');
+        thumb.className = 'slot-thumb';
+        thumb.textContent = 'Rendering…';
+        const label = document.createElement('div');
+        label.className = 'slot-label';
+        label.textContent = cand.category;
+        const score = document.createElement('div');
+        score.className = 'slot-score';
+        score.textContent = `score ${cand.score.toFixed(2)}`;
+        const btn = document.createElement('button');
+        btn.textContent = `Pick ${cand.category}`;
+        btn.disabled = true; // enabled once the thumbnail finishes
+        btn.addEventListener('click', () => pickCandidate(id, cand.category));
+        slot.appendChild(thumb);
+        slot.appendChild(label);
+        slot.appendChild(score);
+        slot.appendChild(btn);
+        slotsEl.appendChild(slot);
+        return { slot, thumb, btn, candidate: cand };
+    });
+
+    modal.style.display = 'flex';
+
+    // Render thumbnails sequentially. Each slot mutates currentSettings
+    // around its bake call (see renderCandidateThumbnail) so concurrent
+    // bakes would race on the shared object.
+    for (const { thumb, btn, candidate } of slotEls) {
+        try {
+            await renderCandidateThumbnail(thumb, candidate);
+        } catch (err) {
+            console.error(`renderCandidateThumbnail(${candidate.category}) failed:`, err);
+            thumb.textContent = 'Render failed';
+        }
+        btn.disabled = false;
+    }
+}
+
+// renderCandidateThumbnail bakes the asset under one candidate
+// strategy and stuffs the result into the slot's thumbnail container.
+// The hard-surface special case skips the bake entirely (slice_axis is
+// the `n/a` sentinel — feeding it to the slice resolver would crash).
+async function renderCandidateThumbnail(thumbEl, candidate) {
+    if (!currentModel) throw new Error('no currentModel');
+    const strategy = STRATEGY_TABLE[candidate.category];
+    if (!strategy) throw new Error(`unknown strategy ${candidate.category}`);
+
+    if (candidate.category === 'hard-surface') {
+        // Hard-surface routes to the parametric pipeline (S-001), not
+        // the slice bake. Show the raw model with a caption explaining
+        // why there is no slice preview.
+        const canvas = renderModelToCanvas(currentModel, COMPARISON_THUMB_SIZE);
+        _replaceThumbWithCanvas(thumbEl, canvas, '(parametric — no slicing)');
+        return;
+    }
+
+    // Snapshot, mutate, restore. Sequential by construction; no race.
+    const saved = {
+        slice_axis: currentSettings.slice_axis,
+        slice_distribution_mode: currentSettings.slice_distribution_mode,
+        volumetric_layers: currentSettings.volumetric_layers,
+    };
+    currentSettings.slice_axis = strategy.slice_axis;
+    currentSettings.slice_distribution_mode = strategy.slice_distribution_mode;
+    currentSettings.volumetric_layers = strategy.volumetric_layers;
+
+    let glbBuf;
+    try {
+        glbBuf = await renderHorizontalLayerGLB(currentModel, strategy.volumetric_layers, COMPARISON_THUMB_SIZE);
+    } finally {
+        currentSettings.slice_axis = saved.slice_axis;
+        currentSettings.slice_distribution_mode = saved.slice_distribution_mode;
+        currentSettings.volumetric_layers = saved.volumetric_layers;
+    }
+
+    const blob = new Blob([glbBuf], { type: 'model/gltf-binary' });
+    const url = URL.createObjectURL(blob);
+    let loaded;
+    try {
+        const reloadLoader = new GLTFLoader();
+        loaded = await new Promise((resolve, reject) => {
+            reloadLoader.load(url, resolve, undefined, reject);
+        });
+    } finally {
+        URL.revokeObjectURL(url);
+    }
+
+    const canvas = renderModelToCanvas(loaded.scene, COMPARISON_THUMB_SIZE);
+    _replaceThumbWithCanvas(thumbEl, canvas, '');
+}
+
+// renderModelToCanvas frames a model in a fresh offscreen renderer
+// and returns a 2D canvas snapshot at the requested size. Used for
+// both the bake-roundtrip path and the hard-surface "raw model"
+// fallback in the comparison modal.
+function renderModelToCanvas(model, resolution) {
+    const offRenderer = new THREE.WebGLRenderer({ antialias: true, alpha: true, preserveDrawingBuffer: true });
+    offRenderer.setSize(resolution, resolution);
+    offRenderer.setClearColor(0x000000, 0);
+    offRenderer.outputColorSpace = THREE.SRGBColorSpace;
+    offRenderer.toneMapping = THREE.ACESFilmicToneMapping;
+    offRenderer.toneMappingExposure = 1.0;
+
+    const offScene = new THREE.Scene();
+    offScene.add(new THREE.AmbientLight(0xffffff, 0.7));
+    const dl = new THREE.DirectionalLight(0xffffff, 1.2);
+    dl.position.set(2, 4, 2);
+    offScene.add(dl);
+
+    // We attach the live model to a temporary parent for framing math
+    // and then detach so the live preview isn't disturbed. matrixWorld
+    // updates are forced so the bbox math is accurate.
+    const wrapper = new THREE.Group();
+    const originalParent = model.parent;
+    if (originalParent) originalParent.remove(model);
+    wrapper.add(model);
+    offScene.add(wrapper);
+    wrapper.updateMatrixWorld(true);
+
+    const box = new THREE.Box3().setFromObject(wrapper);
+    const center = box.getCenter(new THREE.Vector3());
+    const size = box.getSize(new THREE.Vector3());
+    const radius = Math.max(size.x, size.y, size.z) * 0.85 + 0.001;
+
+    const offCamera = new THREE.PerspectiveCamera(45, 1, 0.01, radius * 20);
+    const dist = radius * 2.4;
+    offCamera.position.set(center.x + dist, center.y + dist * 0.5, center.z + dist);
+    offCamera.lookAt(center);
+
+    offRenderer.render(offScene, offCamera);
+
+    const src = offRenderer.domElement;
+    const out = document.createElement('canvas');
+    out.width = resolution;
+    out.height = resolution;
+    out.getContext('2d').drawImage(src, 0, 0);
+
+    // Restore the live preview parenting.
+    wrapper.remove(model);
+    if (originalParent) originalParent.add(model);
+
+    offRenderer.dispose();
+    return out;
+}
+
+function _replaceThumbWithCanvas(thumbEl, canvas, caption) {
+    thumbEl.innerHTML = '';
+    thumbEl.style.background = 'none';
+    const img = document.createElement('img');
+    img.src = canvas.toDataURL('image/png');
+    img.alt = caption || '';
+    img.width = COMPARISON_THUMB_SIZE;
+    img.height = COMPARISON_THUMB_SIZE;
+    thumbEl.appendChild(img);
+    if (caption) {
+        const cap = document.createElement('div');
+        cap.style.fontSize = '10px';
+        cap.style.color = '#888';
+        cap.style.marginTop = '4px';
+        cap.textContent = caption;
+        thumbEl.appendChild(cap);
+    }
+}
+
+// pickCandidate POSTs the override and, on success, swaps the new
+// settings into currentSettings, refreshes the tuning panel, and
+// closes the modal. The classification_override analytics event is
+// emitted server-side; JS does not double-fire.
+async function pickCandidate(id, category) {
+    const errEl = document.getElementById('comparisonError');
+    if (errEl) errEl.textContent = '';
+    try {
+        const { settings } = await fetchClassification(id, category);
+        currentSettings = settings;
+        populateTuningUI();
+        // Refresh the file list so the dirty indicator updates.
+        if (typeof refreshFiles === 'function') {
+            refreshFiles().catch(() => {});
+        }
+        closeComparisonModal();
+    } catch (err) {
+        console.error('pickCandidate failed:', err);
+        if (errEl) errEl.textContent = `Override failed: ${err.message || err}`;
+    }
+}
+
+function closeComparisonModal() {
+    const modal = document.getElementById('comparisonModal');
+    if (!modal) return;
+    modal.style.display = 'none';
+    const slotsEl = document.getElementById('comparisonSlots');
+    if (slotsEl) slotsEl.innerHTML = '';
+    delete modal.dataset.assetId;
+    delete modal.dataset.originalCategory;
+    delete modal.dataset.originalConfidence;
+}
+
+window.openComparisonModal = openComparisonModal;
+window.closeComparisonModal = closeComparisonModal;
+
 // ── Tuning UI (T-002-03) ──
 // One control per AssetSettings field. populateTuningUI runs after every
 // loadSettings; wireTuningUI runs once at module init. The dirty dot
@@ -343,6 +628,11 @@ const TUNING_SPEC = [
     // them up the moment T-005-02 lands the controls; populate/wire
     // both short-circuit harmlessly when the elements are absent.
     { field: 'slice_distribution_mode', id: 'tuneSliceDistributionMode', parse: v => v,             fmt: v => v },
+    // T-004-03: slice_axis is populated by the strategy router on
+    // classification. The DOM id is reserved here so a future tuning
+    // control gets auto-instrumented; populate/wire short-circuit
+    // harmlessly when the element is absent.
+    { field: 'slice_axis',              id: 'tuneSliceAxis',             parse: v => v,             fmt: v => v },
     { field: 'ground_align',            id: 'tuneGroundAlign',           parse: v => v === true || v === 'true',
                                                                           fmt: v => String(v) },
 ];
@@ -364,6 +654,16 @@ function populateTuningUI() {
     }
     updateTuningDirty();
     syncReferenceImageRow();
+    // T-004-04: refresh the shape-category hint next to the
+    // Reclassify… button so the user knows what they'd be overriding.
+    const hint = document.getElementById('tuneShapeCategoryHint');
+    if (hint) {
+        const cat = currentSettings.shape_category || 'unknown';
+        const conf = currentSettings.shape_confidence;
+        hint.textContent = (conf > 0)
+            ? `${cat} @ ${conf.toFixed(2)}`
+            : cat;
+    }
 }
 
 function wireTuningUI() {
@@ -430,6 +730,39 @@ function wireTuningUI() {
             applyLightingPreset('default');
         });
     }
+    // T-004-04: manual Reclassify… opens the comparison modal
+    // regardless of confidence. Always re-runs the classifier.
+    const reclassBtn = document.getElementById('tuneReclassifyBtn');
+    if (reclassBtn) {
+        reclassBtn.addEventListener('click', async () => {
+            if (!selectedFileId || !currentModel) return;
+            reclassBtn.disabled = true;
+            try {
+                const { settings, candidates } = await fetchClassification(selectedFileId);
+                currentSettings = settings;
+                populateTuningUI();
+                if (candidates && candidates.length > 0) {
+                    await openComparisonModal(
+                        selectedFileId,
+                        candidates,
+                        settings.shape_category,
+                        settings.shape_confidence,
+                    );
+                }
+            } catch (err) {
+                console.warn('manual reclassify failed:', err);
+            } finally {
+                reclassBtn.disabled = false;
+            }
+        });
+    }
+    // T-004-04: cancel + backdrop click both close the modal without
+    // recording an analytics event. The asset's classifier-derived
+    // state is preserved.
+    const cancelBtn = document.getElementById('comparisonCancelBtn');
+    if (cancelBtn) cancelBtn.addEventListener('click', closeComparisonModal);
+    const backdrop = document.getElementById('comparisonBackdrop');
+    if (backdrop) backdrop.addEventListener('click', closeComparisonModal);
 }
 
 function updateTuningDirty() {
@@ -1592,28 +1925,93 @@ function pickAdaptiveLayerCount(model, baseLayers) {
     return baseLayers;
 }
 
+// T-004-03: resolve a slice-axis sentinel against the model's
+// world-space bounding box and return a {rotation, inverse} pair of
+// THREE.Quaternions. Slicing always operates on a Y-up frame, so for
+// non-Y axes we rotate the model into a Y-aligned working frame,
+// slice as before, then apply the inverse rotation to the export
+// scene root so the produced GLB lives in the original world frame.
+//
+//   - 'y'                : identity (current behavior).
+//   - 'auto-horizontal'  : whichever of X / Z is the longer extent.
+//   - 'auto-thin'        : whichever of X / Y / Z is the shortest.
+//
+// Unknown / empty modes fall through to identity so a stale setting
+// can never crash the bake.
+function resolveSliceAxisRotation(model, mode) {
+    const identity = { rotation: new THREE.Quaternion(), inverse: new THREE.Quaternion() };
+    if (!mode || mode === 'y') return identity;
+
+    const box = new THREE.Box3().setFromObject(model);
+    const size = box.getSize(new THREE.Vector3());
+
+    let pickAxis;
+    if (mode === 'auto-horizontal') {
+        pickAxis = (size.x >= size.z) ? 'x' : 'z';
+    } else if (mode === 'auto-thin') {
+        const m = Math.min(size.x, size.y, size.z);
+        if (m === size.x) pickAxis = 'x';
+        else if (m === size.z) pickAxis = 'z';
+        else pickAxis = 'y';
+    } else {
+        return identity;
+    }
+
+    if (pickAxis === 'y') return identity;
+
+    // Build a quaternion that rotates the chosen unit axis to +Y.
+    const from = new THREE.Vector3(
+        pickAxis === 'x' ? 1 : 0,
+        0,
+        pickAxis === 'z' ? 1 : 0,
+    );
+    const to = new THREE.Vector3(0, 1, 0);
+    const rotation = new THREE.Quaternion().setFromUnitVectors(from, to);
+    const inverse = rotation.clone().invert();
+    return { rotation, inverse };
+}
+
 function renderHorizontalLayerGLB(model, numLayers, resolution) {
     return new Promise((resolve, reject) => {
         const exportScene = new THREE.Scene();
+
+        // T-004-03: if the strategy router selected a non-Y slice
+        // axis (directional → auto-horizontal, planar → auto-thin),
+        // wrap the model in a temporary group whose rotation aligns
+        // the chosen axis with +Y. The slicing pipeline below is
+        // unchanged — it always cuts along Y in its working frame.
+        // The inverse rotation is applied to the exportScene root at
+        // the bottom so the produced GLB sits in the original world
+        // frame.
+        const sliceAxisMode = currentSettings.slice_axis || 'y';
+        const { rotation, inverse } = resolveSliceAxisRotation(model, sliceAxisMode);
+        let workModel = model;
+        if (rotation.w !== 1 || rotation.x !== 0 || rotation.y !== 0 || rotation.z !== 0) {
+            const wrapper = new THREE.Group();
+            wrapper.quaternion.copy(rotation);
+            wrapper.add(model);
+            wrapper.updateMatrixWorld(true);
+            workModel = wrapper;
+        }
 
         // Adaptive: pick layer count by aspect ratio, then dispatch on
         // the per-asset slice_distribution_mode (T-005-01). The default
         // case falls through to the legacy vertex-quantile picker so a
         // missing/stale setting degrades to the prior behavior, never
         // a crash.
-        const actualLayers = pickAdaptiveLayerCount(model, numLayers);
+        const actualLayers = pickAdaptiveLayerCount(workModel, numLayers);
         const mode = currentSettings.slice_distribution_mode;
         let boundaries;
         switch (mode) {
             case 'equal-height':
-                boundaries = computeEqualHeightBoundaries(model, actualLayers);
+                boundaries = computeEqualHeightBoundaries(workModel, actualLayers);
                 break;
             case 'visual-density':
-                boundaries = computeVisualDensityBoundaries(model, actualLayers);
+                boundaries = computeVisualDensityBoundaries(workModel, actualLayers);
                 break;
             case 'vertex-quantile':
             default:
-                boundaries = computeAdaptiveSliceBoundaries(model, actualLayers);
+                boundaries = computeAdaptiveSliceBoundaries(workModel, actualLayers);
                 break;
         }
 
@@ -1622,7 +2020,7 @@ function renderHorizontalLayerGLB(model, numLayers, resolution) {
             const ceilingY = boundaries[i + 1];
             const layerThickness = Math.max(ceilingY - floorY, 0.001);
 
-            const { canvas, quadSize } = renderLayerTopDown(model, resolution, floorY, ceilingY);
+            const { canvas, quadSize } = renderLayerTopDown(workModel, resolution, floorY, ceilingY);
 
             const texture = new THREE.CanvasTexture(canvas);
             texture.colorSpace = THREE.SRGBColorSpace;
@@ -1653,6 +2051,42 @@ function renderHorizontalLayerGLB(model, numLayers, resolution) {
         // unchanged; only the GLTF root node transform shifts.
         if (currentSettings.ground_align) {
             exportScene.position.y = -boundaries[0];
+        }
+
+        // T-004-03: if we sliced in a rotated working frame, apply
+        // the inverse rotation to the export root so the produced
+        // GLB sits in the original world frame. The slice quads are
+        // built in the rotated frame and inherit this rotation; the
+        // ground-align translation above happens in the rotated
+        // frame too, which is what we want (the bottom slice ends
+        // up at Y=0 of the *rotated* space, then the wrapping
+        // rotation re-orients the whole stack).
+        //
+        // Detach the original model from the temporary wrapper so
+        // future bake calls in the same session see it in its
+        // pristine parent.
+        if (workModel !== model) {
+            workModel.remove(model);
+            const wrap = new THREE.Group();
+            wrap.quaternion.copy(inverse);
+            wrap.add(exportScene);
+            // GLTFExporter expects a Scene at the top; transplant
+            // the wrapped result into a fresh export scene.
+            const reframed = new THREE.Scene();
+            reframed.add(wrap);
+            // Replace exportScene with the reframed one for the
+            // exporter call below.
+            // eslint-disable-next-line no-param-reassign
+            exportScene.parent = null;
+            // Use a local alias so the exporter call line stays
+            // identical to the pre-T-004-03 shape.
+            const exporter = new GLTFExporter();
+            exporter.parse(reframed, (result) => {
+                resolve(result);
+            }, (err) => {
+                reject(err);
+            }, { binary: true });
+            return;
         }
 
         const exporter = new GLTFExporter();
@@ -2481,36 +2915,43 @@ function frameCamera(model) {
     modelBBox = { box, center, size, maxDim };
 }
 
+// Returns a Promise that resolves once the model is loaded and added to
+// the scene (T-004-04 callers — selectFile auto-reclassify path — need
+// to wait for currentModel to be set before triggering an offscreen
+// bake). Existing call sites ignore the return value, which is fine.
 function loadModel(url, fileSize) {
-    if (!threeReady) return;
+    if (!threeReady) return Promise.resolve();
     clearStressInstances();
     if (currentModel) { scene.remove(currentModel); currentModel = null; }
 
     lastModelUrl = url;
     lastModelSize = fileSize;
 
-    loader.load(url, (gltf) => {
-        currentModel = gltf.scene;
-        // Boost env map intensity on all PBR materials so the scene environment
-        // contributes strongly to indirect lighting. Many GLTF exports have this
-        // set conservatively (~1.0); cranking it up brings out leaf greens.
-        applyEnvironmentToModel(currentModel);
-        scene.add(currentModel);
-        frameCamera(currentModel);
+    return new Promise((resolve, reject) => {
+        loader.load(url, (gltf) => {
+            currentModel = gltf.scene;
+            // Boost env map intensity on all PBR materials so the scene environment
+            // contributes strongly to indirect lighting. Many GLTF exports have this
+            // set conservatively (~1.0); cranking it up brings out leaf greens.
+            applyEnvironmentToModel(currentModel);
+            scene.add(currentModel);
+            frameCamera(currentModel);
 
-        // Cache original bbox for stress test spacing
-        if (previewVersion === 'original') {
-            originalModelBBox = { ...modelBBox };
-        }
+            // Cache original bbox for stress test spacing
+            if (previewVersion === 'original') {
+                originalModelBBox = { ...modelBBox };
+            }
 
-        const stats = getModelStats(currentModel);
-        modelTriCount = stats.triangles;
-        statTriangles.textContent = stats.triangles.toLocaleString();
-        statVertices.textContent = stats.vertices.toLocaleString();
-        statSize.textContent = formatBytes(fileSize);
-        previewStats.style.display = 'block';
+            const stats = getModelStats(currentModel);
+            modelTriCount = stats.triangles;
+            statTriangles.textContent = stats.triangles.toLocaleString();
+            statVertices.textContent = stats.vertices.toLocaleString();
+            statSize.textContent = formatBytes(fileSize);
+            previewStats.style.display = 'block';
 
-        if (wireframeEnabled) setWireframe(true);
+            if (wireframeEnabled) setWireframe(true);
+            resolve();
+        }, undefined, reject);
     });
 }
 
@@ -3062,7 +3503,35 @@ function selectFile(id) {
             // scene and reset the stale-bake flag for the new asset.
             applyPresetToLiveScene();
             setBakeStale(false);
-            loadModel(`/api/preview/${id}?version=original&t=${Date.now()}`, file.original_size);
+            const loadPromise = loadModel(`/api/preview/${id}?version=original&t=${Date.now()}`, file.original_size);
+            // T-004-04: low-confidence assets auto-open the comparison
+            // modal once the model has loaded (the modal's thumbnail
+            // pipeline needs currentModel to bake against).
+            // shape_confidence === 1.0 is the human-confirmed sentinel
+            // and skips the prompt; shape_confidence === 0 means
+            // never-classified, also skipped (nothing to compare).
+            const conf = currentSettings && currentSettings.shape_confidence;
+            if (conf > 0 && conf < COMPARISON_AUTO_THRESHOLD) {
+                Promise.resolve(loadPromise).then(async () => {
+                    if (selectedFileId !== id) return; // user already moved on
+                    try {
+                        const { settings, candidates } = await fetchClassification(id);
+                        if (selectedFileId !== id) return;
+                        currentSettings = settings;
+                        populateTuningUI();
+                        if (candidates && candidates.length > 0) {
+                            await openComparisonModal(
+                                id,
+                                candidates,
+                                settings.shape_category,
+                                settings.shape_confidence,
+                            );
+                        }
+                    } catch (err) {
+                        console.warn('auto-reclassify failed:', err);
+                    }
+                });
+            }
         });
     }
 }
