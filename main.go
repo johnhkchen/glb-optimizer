@@ -12,7 +12,7 @@ import (
 	"strings"
 )
 
-//go:embed static/*
+//go:embed static
 var staticFiles embed.FS
 
 func main() {
