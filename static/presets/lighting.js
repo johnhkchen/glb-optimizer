@@ -31,17 +31,27 @@
 // changes. They are seeded equal here.
 
 // makePreset deep-clones bake_config into preview_config so the two
-// are independently mutable but start out identical.
-function makePreset({ id, name, description, bake_config }) {
+// are independently mutable but start out identical. T-007-02:
+// preview_overrides (optional) is a shallow merge applied on top of
+// the cloned bake_config — a per-preset escape hatch for compensating
+// the live preview's busier 5-light topology without breaking color
+// identity between bake and preview.
+function makePreset({ id, name, description, bake_config, preview_overrides }) {
     const clone = (v) => Array.isArray(v) ? v.map(clone)
                        : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).map(([k,x]) => [k, clone(x)]))
                        : v;
+    const preview = clone(bake_config);
+    if (preview_overrides) {
+        for (const [k, v] of Object.entries(preview_overrides)) {
+            preview[k] = clone(v);
+        }
+    }
     return Object.freeze({
         id,
         name,
         description,
         bake_config: Object.freeze(clone(bake_config)),
-        preview_config: Object.freeze(clone(bake_config)),
+        preview_config: Object.freeze(preview),
     });
 }
 
@@ -101,6 +111,13 @@ export const LIGHTING_PRESETS = Object.freeze({
             env_intensity: 1.10,
             tone_exposure: 1.00,
         },
+        // Live preview has 3 directionals on top of ambient+hemi —
+        // the bake numbers wash out under that count. Knock both
+        // diffuse sources back ~35% so the silhouette stays visible.
+        preview_overrides: {
+            ambient: 0.72,
+            hemisphere_intensity: 0.90,
+        },
     }),
     'golden-hour': makePreset({
         id: 'golden-hour',
@@ -119,6 +136,12 @@ export const LIGHTING_PRESETS = Object.freeze({
             env_intensity: 1.30,
             tone_exposure: 1.10,
         },
+        // Live preview key is off-axis (not top-down), so the warm
+        // pool reads stronger; pull key down ~15% to preserve the
+        // dramatic shadow falloff without crushing the model.
+        preview_overrides: {
+            key_intensity: 1.36,
+        },
     }),
     'dusk': makePreset({
         id: 'dusk',
@@ -136,6 +159,13 @@ export const LIGHTING_PRESETS = Object.freeze({
             env_gradient:   [[0.55,0.65,1.00], [0.30,0.38,0.65], [0.08,0.10,0.18]],
             env_intensity: 1.00,
             tone_exposure: 0.85,
+        },
+        // The bake's 0.40 key works because the bake camera sits
+        // directly above. In the live perspective view that leaves
+        // the model nearly invisible — bump enough to see the
+        // silhouette while keeping the dusk mood.
+        preview_overrides: {
+            key_intensity: 0.55,
         },
     }),
     'indoor': makePreset({
