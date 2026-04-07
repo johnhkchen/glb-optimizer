@@ -186,6 +186,33 @@ export const LIGHTING_PRESETS = Object.freeze({
             tone_exposure: 0.95,
         },
     }),
+    // T-007-03: this preset is unusual — its colors are a NEUTRAL
+    // FALLBACK only used when the asset has no reference image yet.
+    // Whenever `referencePalette` is non-null (i.e. an image has been
+    // uploaded for the asset), getActiveBakePalette /
+    // getActivePreviewPalette use it instead of these values, so the
+    // user-uploaded photo's hue is what actually drives bake/preview.
+    // Intensities mirror `default` so picking this preset on a fresh
+    // asset doesn't surprise the user with an extreme lighting setup
+    // before the image is uploaded.
+    'from-reference-image': makePreset({
+        id: 'from-reference-image',
+        name: 'From Reference Image',
+        description: 'Calibrated from your reference image',
+        bake_config: {
+            ambient: 0.50,
+            hemisphere_intensity: 1.00,
+            hemisphere_sky:    [1.00, 1.00, 1.00],
+            hemisphere_ground: [0.27, 0.27, 0.27],
+            key_intensity: 1.40,
+            key_color:     [1.00, 1.00, 1.00],
+            fill_intensity: 0.40,
+            fill_color:     [1.00, 1.00, 1.00],
+            env_gradient:   [[1.00,1.00,1.00], [0.85,0.85,0.85], [0.45,0.45,0.45]],
+            env_intensity: 1.20,
+            tone_exposure: 1.00,
+        },
+    }),
 });
 
 // O(1) lookup. Returns undefined for unknown ids — callers MUST handle
