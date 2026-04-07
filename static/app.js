@@ -5,6 +5,12 @@ import { KTX2Loader } from 'three/addons/loaders/KTX2Loader.js';
 import { MeshoptDecoder } from 'three/addons/libs/meshopt_decoder.module.js';
 import { GLTFExporter } from 'three/addons/exporters/GLTFExporter.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import {
+    LIGHTING_PRESETS,
+    getLightingPreset,
+    listLightingPresets,
+    PRESET_FIELD_MAP,
+} from './presets/lighting.js';
 
 // ── State ──
 let files = [];
@@ -134,6 +140,53 @@ function makeDefaults() {
 function applyDefaults() {
     currentSettings = makeDefaults();
     return currentSettings;
+}
+
+// ── Lighting presets (T-007-01) ──
+// Populate the lighting preset dropdown from the registry. Idempotent;
+// safe to call more than once. The select is intentionally empty in
+// index.html so this function is the single source of truth.
+function populateLightingPresetSelect() {
+    const sel = document.getElementById('tuneLightingPreset');
+    if (!sel) return;
+    sel.innerHTML = '';
+    for (const p of listLightingPresets()) {
+        const opt = document.createElement('option');
+        opt.value = p.id;
+        opt.textContent = p.name;
+        opt.title = p.description;
+        sel.appendChild(opt);
+    }
+}
+
+// Apply a lighting preset to currentSettings, refresh the UI, save,
+// and emit a single preset_applied analytics event capturing the
+// cascade. Falls back to the 'default' preset if the id is unknown
+// (corrupt settings file, hand-edit). Picking a preset is treated as
+// one user intent, NOT N rapid setting_changed events — see
+// design.md decision D4.
+function applyLightingPreset(id) {
+    const preset = getLightingPreset(id) || getLightingPreset('default');
+    if (!preset || !currentSettings) return;
+    const before = { lighting_preset: currentSettings.lighting_preset };
+    const after = { lighting_preset: preset.id };
+    const changed = {};
+    for (const [presetKey, settingsKey] of Object.entries(PRESET_FIELD_MAP)) {
+        const newVal = preset.bake_config[presetKey];
+        const oldVal = currentSettings[settingsKey];
+        if (newVal !== oldVal) {
+            changed[settingsKey] = { from: oldVal, to: newVal };
+            currentSettings[settingsKey] = newVal;
+        }
+    }
+    currentSettings.lighting_preset = preset.id;
+    populateTuningUI();
+    if (selectedFileId) saveSettings(selectedFileId);
+    logEvent('preset_applied', {
+        from: before.lighting_preset,
+        to: after.lighting_preset,
+        changed,
+    }, selectedFileId);
 }
 
 // ── Analytics (T-003-01 / T-003-02) ──
@@ -315,6 +368,15 @@ function wireTuningUI() {
             const raw = el.type === 'checkbox' ? el.checked : el.value;
             const v = spec.parse(raw);
             if (v === oldValue) return;
+            // T-007-01: lighting_preset is a cascade trigger, not a
+            // plain field write. applyLightingPreset rewrites the
+            // dependent intensity sliders, calls populateTuningUI()
+            // to refresh, saves, and emits a single preset_applied
+            // analytics event in lieu of N setting_changed events.
+            if (spec.field === 'lighting_preset') {
+                applyLightingPreset(v);
+                return;
+            }
             currentSettings[spec.field] = v;
             const valEl = document.getElementById(spec.id + 'Value');
             if (valEl) valEl.textContent = spec.fmt(v);
@@ -3124,6 +3186,7 @@ console.log('GLB Optimizer frontend loaded');
 initThreeJS();
 refreshFiles();
 applyDefaults();
+populateLightingPresetSelect();
 wireTuningUI();
 populateTuningUI();
 
