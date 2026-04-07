@@ -34,6 +34,8 @@ type AssetSettings struct {
 	LightingPreset        string  `json:"lighting_preset"`
 	SliceDistributionMode string  `json:"slice_distribution_mode"`
 	GroundAlign           bool    `json:"ground_align"`
+	ColorCalibrationMode  string  `json:"color_calibration_mode"`
+	ReferenceImagePath    string  `json:"reference_image_path,omitempty"`
 }
 
 // DefaultSettings returns the canonical v1 defaults. These match the
@@ -54,6 +56,8 @@ func DefaultSettings() *AssetSettings {
 		LightingPreset:        "default",
 		SliceDistributionMode: "visual-density",
 		GroundAlign:           true,
+		ColorCalibrationMode:  "none",
+		ReferenceImagePath:    "",
 	}
 }
 
@@ -74,6 +78,13 @@ var validSliceDistributionModes = map[string]bool{
 	"equal-height":    true,
 	"vertex-quantile": true,
 	"visual-density":  true,
+}
+
+// validColorCalibrationModes enumerates the allowed values for
+// ColorCalibrationMode (T-005-03). The full preset enum lands in S-007.
+var validColorCalibrationModes = map[string]bool{
+	"none":                 true,
+	"from-reference-image": true,
 }
 
 // Validate checks the AssetSettings against the v1 schema. It returns the
@@ -118,7 +129,11 @@ func (s *AssetSettings) Validate() error {
 	if !validSliceDistributionModes[s.SliceDistributionMode] {
 		return fmt.Errorf("slice_distribution_mode %q is not a known mode", s.SliceDistributionMode)
 	}
+	if !validColorCalibrationModes[s.ColorCalibrationMode] {
+		return fmt.Errorf("color_calibration_mode %q is not a known mode", s.ColorCalibrationMode)
+	}
 	// GroundAlign is a bool; both values are valid.
+	// ReferenceImagePath is a free string; empty means "not set".
 	return nil
 }
 
@@ -151,7 +166,9 @@ func SettingsDifferFromDefaults(s *AssetSettings) bool {
 		s.AlphaTest != d.AlphaTest ||
 		s.LightingPreset != d.LightingPreset ||
 		s.SliceDistributionMode != d.SliceDistributionMode ||
-		s.GroundAlign != d.GroundAlign
+		s.GroundAlign != d.GroundAlign ||
+		s.ColorCalibrationMode != d.ColorCalibrationMode ||
+		s.ReferenceImagePath != d.ReferenceImagePath
 }
 
 // SettingsFilePath returns the on-disk path for the given asset id.
@@ -204,6 +221,12 @@ func LoadSettings(id, dir string) (*AssetSettings, error) {
 	}
 	if err := json.Unmarshal(data, &probe); err == nil && probe.GroundAlign == nil {
 		s.GroundAlign = true
+	}
+	// Forward-compat normalization for files written before T-005-03.
+	// Empty string would otherwise fail enum validation; default to
+	// the documented "none" (neutral lighting).
+	if s.ColorCalibrationMode == "" {
+		s.ColorCalibrationMode = "none"
 	}
 	return &s, nil
 }

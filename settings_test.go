@@ -74,6 +74,8 @@ func TestValidate_RejectsOutOfRange(t *testing.T) {
 		{"unknown preset", func(s *AssetSettings) { s.LightingPreset = "studio" }},
 		{"empty slice mode", func(s *AssetSettings) { s.SliceDistributionMode = "" }},
 		{"unknown slice mode", func(s *AssetSettings) { s.SliceDistributionMode = "spirals" }},
+		{"empty calibration mode", func(s *AssetSettings) { s.ColorCalibrationMode = "" }},
+		{"unknown calibration mode", func(s *AssetSettings) { s.ColorCalibrationMode = "preset-x" }},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -193,6 +195,8 @@ func TestSettingsDifferFromDefaults(t *testing.T) {
 			{"key_light_intensity", func(s *AssetSettings) { s.KeyLightIntensity = 2.0 }},
 			{"ground_align", func(s *AssetSettings) { s.GroundAlign = false }},
 			{"slice_distribution_mode", func(s *AssetSettings) { s.SliceDistributionMode = "equal-height" }},
+			{"color_calibration_mode", func(s *AssetSettings) { s.ColorCalibrationMode = "from-reference-image" }},
+			{"reference_image_path", func(s *AssetSettings) { s.ReferenceImagePath = "outputs/x_reference.png" }},
 		}
 		for _, c := range cases {
 			t.Run(c.name, func(t *testing.T) {
@@ -212,6 +216,48 @@ func TestSettingsDifferFromDefaults(t *testing.T) {
 			t.Error("schema_version-only divergence should not flag dirty")
 		}
 	})
+}
+
+// TestLoadSettings_NormalizesColorCalibrationMode asserts that a
+// pre-T-005-03 document with no color_calibration_mode key loads with
+// the new field defaulted to "none" and validates cleanly.
+func TestLoadSettings_NormalizesColorCalibrationMode(t *testing.T) {
+	dir := t.TempDir()
+	id := "legacy-cal"
+	doc := `{
+  "schema_version": 1,
+  "volumetric_layers": 4,
+  "volumetric_resolution": 512,
+  "dome_height_factor": 0.5,
+  "bake_exposure": 1.0,
+  "ambient_intensity": 0.5,
+  "hemisphere_intensity": 1.0,
+  "key_light_intensity": 1.4,
+  "bottom_fill_intensity": 0.4,
+  "env_map_intensity": 1.2,
+  "alpha_test": 0.10,
+  "lighting_preset": "default",
+  "slice_distribution_mode": "visual-density",
+  "ground_align": true
+}
+`
+	path := filepath.Join(dir, id+".json")
+	if err := os.WriteFile(path, []byte(doc), 0644); err != nil {
+		t.Fatalf("write doc: %v", err)
+	}
+	loaded, err := LoadSettings(id, dir)
+	if err != nil {
+		t.Fatalf("LoadSettings: %v", err)
+	}
+	if loaded.ColorCalibrationMode != "none" {
+		t.Errorf("ColorCalibrationMode = %q, want %q", loaded.ColorCalibrationMode, "none")
+	}
+	if loaded.ReferenceImagePath != "" {
+		t.Errorf("ReferenceImagePath = %q, want empty", loaded.ReferenceImagePath)
+	}
+	if err := loaded.Validate(); err != nil {
+		t.Errorf("normalized doc failed validation: %v", err)
+	}
 }
 
 func TestSettingsExist(t *testing.T) {
