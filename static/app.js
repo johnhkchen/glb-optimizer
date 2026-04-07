@@ -182,6 +182,10 @@ function applyLightingPreset(id) {
     }
     currentSettings.lighting_preset = preset.id;
     populateTuningUI();
+    // T-007-02: refresh the live three.js scene lights and mark the
+    // on-disk bake as stale until the user regenerates.
+    applyPresetToLiveScene();
+    setBakeStale(true);
     if (selectedFileId) saveSettings(selectedFileId);
     logEvent('preset_applied', {
         from: before.lighting_preset,
@@ -911,6 +915,7 @@ async function generateBillboard(id) {
         store_update(id, f => f.has_billboard = true);
         updatePreviewButtons();
         success = true;
+        setBakeStale(false); // T-007-02
     } catch (err) { console.error('Billboard generation failed:', err); }
     finally {
         logEvent('regenerate', { trigger: 'billboard', success }, id);
@@ -1333,6 +1338,7 @@ async function generateVolumetric(id) {
         store_update(id, f => f.has_volumetric = true);
         updatePreviewButtons();
         success = true;
+        setBakeStale(false); // T-007-02
     } catch (err) { console.error('Volumetric generation failed:', err); }
     finally {
         logEvent('regenerate', { trigger: 'volumetric', success }, id);
@@ -1687,6 +1693,7 @@ async function generateVolumetricLODs(id) {
         await refreshFiles();
         updatePreviewButtons();
         success = true;
+        setBakeStale(false); // T-007-02
     } catch (err) { console.error('Volumetric LOD generation failed:', err); }
     finally {
         logEvent('regenerate', { trigger: 'volumetric_lods', success }, id);
@@ -1730,6 +1737,7 @@ async function generateProductionAsset(id) {
         await refreshFiles();
         updatePreviewButtons();
         success = true;
+        setBakeStale(false); // T-007-02
     } catch (err) { console.error('Production asset generation failed:', err); }
     finally {
         logEvent('regenerate', { trigger: 'production', success }, id);
@@ -3038,6 +3046,10 @@ function selectFile(id) {
             await startAnalyticsSession(id);
             populateTuningUI();
             populateAcceptedUI(id);
+            // T-007-02: apply the asset's saved preset to the live
+            // scene and reset the stale-bake flag for the new asset.
+            applyPresetToLiveScene();
+            setBakeStale(false);
             loadModel(`/api/preview/${id}?version=original&t=${Date.now()}`, file.original_size);
         });
     }
@@ -3074,7 +3086,9 @@ function applyColorCalibration(id) {
         if (referenceEnvironment) { referenceEnvironment.dispose(); referenceEnvironment = null; }
         referencePalette = null;
         scene.environment = defaultEnvironment;
-        resetSceneLights();
+        // T-007-02: when calibration is torn down, fall back to the
+        // active preset rather than raw neutral white.
+        applyPresetToLiveScene();
         if (currentModel) {
             const url = `/api/preview/${id}?version=${previewVersion}&t=${Date.now()}`;
             loadModel(url, lastModelSize);
