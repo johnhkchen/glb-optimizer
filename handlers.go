@@ -37,8 +37,12 @@ func jsonError(w http.ResponseWriter, status int, msg string) {
 	jsonResponse(w, status, map[string]string{"error": msg})
 }
 
-// handleUpload handles POST /api/upload
-func handleUpload(store *FileStore, originalsDir string) http.HandlerFunc {
+// handleUpload handles POST /api/upload. Each successfully written
+// file is auto-classified (T-004-02): the result lands in the asset's
+// settings file and emits a "classification" analytics event. Any
+// classifier failure is logged and swallowed; the upload still
+// succeeds with shape_category="unknown".
+func handleUpload(store *FileStore, originalsDir, settingsDir string, logger *AnalyticsLogger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			jsonError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -91,6 +95,7 @@ func handleUpload(store *FileStore, originalsDir string) http.HandlerFunc {
 				Status:       StatusPending,
 			}
 			store.Add(record)
+			autoClassify(id, originalsDir, settingsDir, store, logger)
 			records = append(records, record)
 		}
 
@@ -671,6 +676,288 @@ func handleSettings(store *FileStore, settingsDir string) http.HandlerFunc {
 		default:
 			jsonError(w, http.StatusMethodNotAllowed, "method not allowed")
 		}
+	}
+}
+
+// applyShapeStrategyToSettings stamps the strategy router's defaults
+// onto the asset's settings, but only for fields that are still at
+// their factory default. The user-override semantics are: if the
+// user has tuned a strategy-shaped field away from defaults, the
+// classification leaves their value alone; otherwise the strategy
+// fills it in. Slice fields carrying the SliceAxisNA sentinel
+// (hard-surface routes to the parametric pipeline) are skipped
+// entirely. Added in T-004-03.
+func applyShapeStrategyToSettings(s *AssetSettings, strategy ShapeStrategy) {
+	d := DefaultSettings()
+	if strategy.SliceAxis != SliceAxisNA && strategy.SliceAxis != "" {
+		if s.SliceAxis == d.SliceAxis {
+			s.SliceAxis = strategy.SliceAxis
+		}
+	}
+	if strategy.SliceDistributionMode != SliceAxisNA && strategy.SliceDistributionMode != "" {
+		if s.SliceDistributionMode == d.SliceDistributionMode {
+			s.SliceDistributionMode = strategy.SliceDistributionMode
+		}
+	}
+	if strategy.SliceCount > 0 {
+		if s.VolumetricLayers == d.VolumetricLayers {
+			s.VolumetricLayers = strategy.SliceCount
+		}
+	}
+}
+
+// applyClassificationToSettings merges a classifier result into the
+// asset's persisted settings. Loads the current settings (or defaults
+// if none exist), overwrites the two shape fields, stamps the
+// strategy router's defaults onto any still-default strategy-shaped
+// fields (T-004-03), validates, and writes atomically. Returns the
+// new settings on success.
+func applyClassificationToSettings(id, settingsDir string, result *ClassificationResult) (*AssetSettings, error) {
+	s, err := LoadSettings(id, settingsDir)
+	if err != nil {
+		return nil, fmt.Errorf("load settings: %w", err)
+	}
+	s.ShapeCategory = result.Category
+	s.ShapeConfidence = result.Confidence
+	applyShapeStrategyToSettings(s, getStrategyForCategory(result.Category))
+	if err := s.Validate(); err != nil {
+		return nil, fmt.Errorf("validate settings: %w", err)
+	}
+	if err := SaveSettings(id, settingsDir, s); err != nil {
+		return nil, fmt.Errorf("save settings: %w", err)
+	}
+	return s, nil
+}
+
+// emitClassificationEvent appends a "classification" analytics event
+// for the asset. Mirrors handleAccept's pattern: failure to emit logs
+// to stderr but does not fail the caller — the persisted settings are
+// the load-bearing artifact, the event is a nice-to-have for the
+// export pipeline.
+func emitClassificationEvent(logger *AnalyticsLogger, id string, result *ClassificationResult) {
+	sessionID, _, err := logger.LookupOrStartSession(id)
+	if err != nil || sessionID == "" {
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "classify: lookup session for %s: %v\n", id, err)
+		}
+		return
+	}
+	ev := Event{
+		SchemaVersion: AnalyticsSchemaVersion,
+		EventType:     "classification",
+		Timestamp:     time.Now().UTC().Format(time.RFC3339Nano),
+		SessionID:     sessionID,
+		AssetID:       id,
+		Payload: map[string]interface{}{
+			"category":   result.Category,
+			"confidence": result.Confidence,
+			"features":   result.Features,
+		},
+	}
+	if err := logger.AppendEvent(sessionID, ev); err != nil {
+		fmt.Fprintf(os.Stderr, "classify: append event for %s: %v\n", id, err)
+	}
+}
+
+// candidate is the typed projection of one entry from the classifier's
+// features.candidates ranking. Used in the /api/classify response so
+// the comparison-UI modal can render top-N candidate strategies. The
+// score is whatever the Python side computed (softmax in [0,1] today).
+type candidate struct {
+	Category string  `json:"category"`
+	Score    float64 `json:"score"`
+}
+
+// extractCandidates pulls the typed candidate list out of the opaque
+// classifier features map. Returns nil when the key is missing or any
+// entry is malformed — the response then carries `null`, and the
+// frontend treats that as "no ranking available, hide the modal". The
+// per-asset settings stamping path is unaffected by a nil return.
+func extractCandidates(features map[string]interface{}) []candidate {
+	raw, ok := features["candidates"]
+	if !ok {
+		return nil
+	}
+	list, ok := raw.([]interface{})
+	if !ok {
+		return nil
+	}
+	out := make([]candidate, 0, len(list))
+	for _, item := range list {
+		m, ok := item.(map[string]interface{})
+		if !ok {
+			return nil
+		}
+		cat, _ := m["category"].(string)
+		score, _ := m["score"].(float64)
+		if cat == "" {
+			return nil
+		}
+		out = append(out, candidate{Category: cat, Score: score})
+	}
+	return out
+}
+
+// emitClassificationOverrideEvent appends a "classification_override"
+// analytics event for the asset. Mirrors emitClassificationEvent in
+// best-effort posture — the persisted settings are the load-bearing
+// artifact, the event is the training-data signal. T-004-04. The
+// payload is the canonical training pair: classifier-original
+// (category, confidence), the full candidate list the user picked
+// from, the chosen category, and the asset features for the model.
+func emitClassificationOverrideEvent(logger *AnalyticsLogger, id, originalCategory string, originalConfidence float64, result *ClassificationResult) {
+	sessionID, _, err := logger.LookupOrStartSession(id)
+	if err != nil || sessionID == "" {
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "classification_override: lookup session for %s: %v\n", id, err)
+		}
+		return
+	}
+	ev := Event{
+		SchemaVersion: AnalyticsSchemaVersion,
+		EventType:     "classification_override",
+		Timestamp:     time.Now().UTC().Format(time.RFC3339Nano),
+		SessionID:     sessionID,
+		AssetID:       id,
+		Payload: map[string]interface{}{
+			"original_category":   originalCategory,
+			"original_confidence": originalConfidence,
+			"candidates":          result.Features["candidates"],
+			"chosen_category":     result.Category,
+			"features":            result.Features,
+		},
+	}
+	if err := logger.AppendEvent(sessionID, ev); err != nil {
+		fmt.Fprintf(os.Stderr, "classification_override: append event for %s: %v\n", id, err)
+	}
+}
+
+// emitStrategySelectedEvent appends a "strategy_selected" analytics
+// event for the asset. Mirrors emitClassificationEvent: failure to
+// emit logs to stderr but does not fail the caller. Added in
+// T-004-03; the event captures which strategy the router picked for
+// a given classification so the export pipeline can correlate user
+// outcomes with router decisions.
+func emitStrategySelectedEvent(logger *AnalyticsLogger, id string, strategy ShapeStrategy) {
+	sessionID, _, err := logger.LookupOrStartSession(id)
+	if err != nil || sessionID == "" {
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "strategy_selected: lookup session for %s: %v\n", id, err)
+		}
+		return
+	}
+	ev := Event{
+		SchemaVersion: AnalyticsSchemaVersion,
+		EventType:     "strategy_selected",
+		Timestamp:     time.Now().UTC().Format(time.RFC3339Nano),
+		SessionID:     sessionID,
+		AssetID:       id,
+		Payload: map[string]interface{}{
+			"category": strategy.Category,
+			"strategy": strategy,
+		},
+	}
+	if err := logger.AppendEvent(sessionID, ev); err != nil {
+		fmt.Fprintf(os.Stderr, "strategy_selected: append event for %s: %v\n", id, err)
+	}
+}
+
+// autoClassify is the upload-time best-effort hook. Any failure
+// (missing python3, classifier crash, settings write error) is logged
+// and swallowed — a classifier outage must never block an upload.
+func autoClassify(id, originalsDir, settingsDir string, store *FileStore, logger *AnalyticsLogger) {
+	glbPath := filepath.Join(originalsDir, id+".glb")
+	result, err := RunClassifier(glbPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "autoClassify %s: %v\n", id, err)
+		return
+	}
+	s, err := applyClassificationToSettings(id, settingsDir, result)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "autoClassify %s: %v\n", id, err)
+		return
+	}
+	dirty := SettingsDifferFromDefaults(s)
+	store.Update(id, func(r *FileRecord) {
+		r.HasSavedSettings = true
+		r.SettingsDirty = dirty
+	})
+	emitClassificationEvent(logger, id, result)
+	emitStrategySelectedEvent(logger, id, getStrategyForCategory(result.Category))
+}
+
+// handleClassify handles POST /api/classify/:id. Re-runs the shape
+// classifier on the asset's original GLB, persists the result into the
+// asset's settings, marks the FileRecord dirty, and emits a
+// "classification" analytics event.
+//
+// T-004-04: the response body is now {settings, candidates}, and an
+// optional `?override=<category>` query parameter switches the handler
+// into override mode: the freshly-measured features are kept (so the
+// stamped strategy reflects current geometry), but the category is
+// replaced by the user's pick and confidence is pinned to 1.0. The
+// override branch emits a "classification_override" event in lieu of
+// the normal "classification" event — the split is intentional so
+// downstream training distinguishes the system's pick from the
+// human correction.
+func handleClassify(store *FileStore, originalsDir, settingsDir string, logger *AnalyticsLogger) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			jsonError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		id := strings.TrimPrefix(r.URL.Path, "/api/classify/")
+		if id == "" {
+			jsonError(w, http.StatusBadRequest, "missing file id")
+			return
+		}
+		if _, ok := store.Get(id); !ok {
+			jsonError(w, http.StatusNotFound, "file not found")
+			return
+		}
+		override := r.URL.Query().Get("override")
+		if override != "" && !validShapeCategories[override] {
+			jsonError(w, http.StatusBadRequest, "unknown override category: "+override)
+			return
+		}
+		glbPath := filepath.Join(originalsDir, id+".glb")
+		result, err := RunClassifier(glbPath)
+		if err != nil {
+			jsonError(w, http.StatusInternalServerError, "classify: "+err.Error())
+			return
+		}
+		var (
+			isOverride        = override != ""
+			originalCategory  = result.Category
+			originalConfidence = result.Confidence
+		)
+		if isOverride {
+			// Synthesize the override result. Re-use the just-measured
+			// features so persisted state and the emitted event both
+			// reflect current geometry, not stale data.
+			result.Category = override
+			result.Confidence = 1.0
+		}
+		s, err := applyClassificationToSettings(id, settingsDir, result)
+		if err != nil {
+			jsonError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		dirty := SettingsDifferFromDefaults(s)
+		store.Update(id, func(r *FileRecord) {
+			r.HasSavedSettings = true
+			r.SettingsDirty = dirty
+		})
+		if isOverride {
+			emitClassificationOverrideEvent(logger, id, originalCategory, originalConfidence, result)
+		} else {
+			emitClassificationEvent(logger, id, result)
+		}
+		emitStrategySelectedEvent(logger, id, getStrategyForCategory(result.Category))
+		jsonResponse(w, http.StatusOK, map[string]interface{}{
+			"settings":   s,
+			"candidates": extractCandidates(result.Features),
+		})
 	}
 }
 
