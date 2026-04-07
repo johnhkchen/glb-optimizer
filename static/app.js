@@ -32,6 +32,7 @@ let pmremGenerator = null;
 let defaultEnvironment = null;
 let referenceEnvironment = null; // PMREM texture from user-provided reference image
 let referencePalette = null; // { bright, mid, dark } colors used to tint bake lights
+let bakeStale = false; // T-007-02: set true when preset changes after last regenerate
 let currentSettings = null; // per-asset bake/tuning settings, populated by selectFile()
 let _saveSettingsTimer = null; // debounce handle for saveSettings()
 
@@ -1009,6 +1010,82 @@ function getActiveBakePalette() {
         };
     }
     return resolvePresetColors(preset.bake_config);
+}
+
+// T-007-02: Live-preview palette resolution. Same priority order as
+// getActiveBakePalette but reads preview_config so per-preset live
+// attenuations can diverge from the bake without losing color
+// identity.
+function getActivePreviewPalette() {
+    if (referencePalette) return referencePalette;
+    const id = currentSettings && currentSettings.lighting_preset;
+    const preset = getLightingPreset(id) || getLightingPreset('default');
+    if (!preset) {
+        return {
+            bright: { r: 1, g: 1, b: 1 },
+            mid:    { r: 1, g: 1, b: 1 },
+            dark:   { r: 0.19, g: 0.19, b: 0.25 },
+            key:    { r: 1, g: 1, b: 1 },
+            fill:   { r: 1, g: 1, b: 1 },
+        };
+    }
+    return resolvePresetColors(preset.preview_config);
+}
+
+// T-007-02: Apply the active preset's preview_config to the live
+// three.js scene's lights in place. The live scene has 1 Ambient + 1
+// Hemisphere + 3 Directional lights set up in initThreeJS(). We do
+// not rebuild — we walk the scene and mutate color/intensity. If the
+// scene hasn't been initialized yet, this is a no-op.
+//
+// Directional-light role is discriminated by position (set in
+// initThreeJS): the original key is at +x +y, dirLight2 is at -x,
+// dirLight3 is at -y.
+function applyPresetToLiveScene() {
+    if (!scene || !currentSettings) return;
+    const palette = getActivePreviewPalette();
+    const id = currentSettings.lighting_preset;
+    const preset = getLightingPreset(id) || getLightingPreset('default');
+    if (!preset) return;
+    const pc = preset.preview_config;
+    const sky    = new THREE.Color(palette.bright.r, palette.bright.g, palette.bright.b);
+    const ground = new THREE.Color(palette.dark.r,   palette.dark.g,   palette.dark.b);
+    const key    = new THREE.Color(palette.key.r,    palette.key.g,    palette.key.b);
+    const fill   = new THREE.Color(palette.fill.r,   palette.fill.g,   palette.fill.b);
+
+    scene.traverse((obj) => {
+        if (obj.isAmbientLight) {
+            obj.color.copy(sky);
+            obj.intensity = pc.ambient;
+        } else if (obj.isHemisphereLight) {
+            obj.color.copy(sky);
+            obj.groundColor.copy(ground);
+            obj.intensity = pc.hemisphere_intensity;
+        } else if (obj.isDirectionalLight) {
+            if (obj.position.y < 0) {
+                // Under-fill (dirLight3 in initThreeJS).
+                obj.color.copy(fill);
+                obj.intensity = pc.fill_intensity;
+            } else if (obj.position.x < 0) {
+                // Back/rim (dirLight2). Soft sky tint at attenuated key.
+                obj.color.copy(sky);
+                obj.intensity = pc.key_intensity * 0.55;
+            } else {
+                // Main key (dirLight).
+                obj.color.copy(key);
+                obj.intensity = pc.key_intensity;
+            }
+        }
+    });
+}
+
+// T-007-02: Toggle the "bake out of date" hint. Idempotent. The hint
+// is purely client-side, in-memory state per design.md D6 — not
+// persisted across reloads.
+function setBakeStale(stale) {
+    bakeStale = !!stale;
+    const el = document.getElementById('bakeStaleHint');
+    if (el) el.style.display = bakeStale ? '' : 'none';
 }
 
 // Add bake lights to an offscreen scene. Tinted by the reference palette if
