@@ -820,3 +820,118 @@ select option {
     font-weight: bold;
     margin-left: 4px;
 }
+
+/* ── T-004-04: Comparison modal ── */
+.shape-hint {
+    margin-left: 8px;
+    font-size: 10px;
+    color: var(--text-muted);
+}
+.modal {
+    position: fixed;
+    inset: 0;
+    z-index: 1000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+.modal-backdrop {
+    position: absolute;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.6);
+}
+.modal-card {
+    position: relative;
+    background: var(--panel-bg);
+    border: 1px solid var(--panel-border);
+    border-radius: 6px;
+    padding: 20px 24px;
+    min-width: 480px;
+    max-width: 90vw;
+    color: var(--text);
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+}
+.modal-card h2 {
+    font-size: 16px;
+    margin-bottom: 6px;
+}
+.modal-subtitle {
+    font-size: 12px;
+    color: var(--text-muted);
+    margin-bottom: 14px;
+}
+.comparison-slots {
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+    justify-content: center;
+}
+.comparison-slot {
+    width: 256px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+    background: var(--bg);
+    border: 1px solid var(--panel-border);
+    border-radius: 4px;
+    padding: 8px;
+}
+.comparison-slot img,
+.comparison-slot .slot-thumb {
+    width: 256px;
+    height: 256px;
+    background: #000;
+    border-radius: 2px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--text-muted);
+    font-size: 12px;
+}
+.comparison-slot .slot-label {
+    font-size: 12px;
+    font-weight: 600;
+}
+.comparison-slot .slot-score {
+    font-size: 10px;
+    color: var(--text-muted);
+}
+.comparison-slot button {
+    width: 100%;
+    background: var(--accent);
+    color: #fff;
+    border: 0;
+    border-radius: 3px;
+    padding: 6px 8px;
+    font-size: 12px;
+    cursor: pointer;
+}
+.comparison-slot button:hover {
+    background: var(--accent-hover);
+}
+.comparison-slot button:disabled {
+    opacity: 0.5;
+    cursor: default;
+}
+.comparison-error {
+    color: var(--error);
+    font-size: 11px;
+    min-height: 14px;
+    margin-top: 8px;
+    text-align: center;
+}
+.modal-actions {
+    margin-top: 14px;
+    display: flex;
+    justify-content: flex-end;
+}
+.modal-actions button {
+    background: var(--panel-border);
+    color: var(--text);
+    border: 0;
+    border-radius: 3px;
+    padding: 6px 12px;
+    font-size: 12px;
+    cursor: pointer;
+}
