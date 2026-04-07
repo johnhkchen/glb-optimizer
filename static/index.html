@@ -320,6 +320,11 @@
                 </div>
 
                 <div class="setting-row">
+                    <button class="preset-btn" id="tuneReclassifyBtn">Reclassify…</button>
+                    <span id="tuneShapeCategoryHint" class="shape-hint"></span>
+                </div>
+
+                <div class="setting-row">
                     <button class="preset-btn" id="tuneResetBtn">Reset to defaults</button>
                 </div>
             </div>
@@ -358,6 +363,23 @@
                     <button class="preset-btn" id="acceptBtn" disabled>Mark as Accepted</button>
                     <span id="acceptStatus" class="accept-status"></span>
                 </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- T-004-04: Multi-strategy comparison modal. Hidden by default;
+         openComparisonModal() in app.js builds the slot DOM and shows
+         the modal when the classifier returns confidence < 0.7 or when
+         the user clicks Reclassify… in the tuning panel. -->
+    <div id="comparisonModal" class="modal" style="display:none">
+        <div class="modal-backdrop" id="comparisonBackdrop"></div>
+        <div class="modal-card">
+            <h2>Pick the best strategy</h2>
+            <p class="modal-subtitle" id="comparisonSubtitle"></p>
+            <div class="comparison-slots" id="comparisonSlots"></div>
+            <div class="comparison-error" id="comparisonError"></div>
+            <div class="modal-actions">
+                <button id="comparisonCancelBtn">Cancel</button>
             </div>
         </div>
     </div>
