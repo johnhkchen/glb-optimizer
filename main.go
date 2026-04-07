@@ -55,8 +55,13 @@ func main() {
 
 	originalsDir := filepath.Join(workDir, "originals")
 	outputsDir := filepath.Join(workDir, "outputs")
+	settingsDir := filepath.Join(workDir, "settings")
+	tuningDir := filepath.Join(workDir, "tuning")
+	profilesDir := filepath.Join(workDir, "profiles")
+	acceptedDir := filepath.Join(workDir, "accepted")
+	acceptedThumbsDir := filepath.Join(acceptedDir, "thumbs")
 
-	for _, d := range []string{originalsDir, outputsDir} {
+	for _, d := range []string{originalsDir, outputsDir, settingsDir, tuningDir, profilesDir, acceptedDir, acceptedThumbsDir} {
 		if err := os.MkdirAll(d, 0755); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: cannot create directory %s: %v\n", d, err)
 			os.Exit(1)
@@ -85,7 +90,10 @@ func main() {
 
 	// Initialize file store and scan existing files
 	store := NewFileStore()
-	scanExistingFiles(store, originalsDir, outputsDir)
+	scanExistingFiles(store, originalsDir, outputsDir, settingsDir, acceptedDir)
+
+	// Analytics logger writes per-session JSONL into tuningDir.
+	analyticsLogger := NewAnalyticsLogger(tuningDir)
 
 	// Processing queue channel (unused for now — processing is synchronous)
 	queue := make(chan processJob, 100)
@@ -111,8 +119,28 @@ func main() {
 	mux.HandleFunc("/api/generate-lods/", handleGenerateLODs(store, originalsDir, outputsDir))
 	mux.HandleFunc("/api/generate-blender-lods/", handleGenerateBlenderLODs(store, originalsDir, outputsDir, blenderInfo, blenderScriptPath))
 	mux.HandleFunc("/api/upload-billboard/", handleUploadBillboard(store, outputsDir))
+	mux.HandleFunc("/api/upload-volumetric/", handleUploadVolumetric(store, outputsDir))
+	mux.HandleFunc("/api/upload-volumetric-lod/", handleUploadVolumetricLOD(store, outputsDir))
+	mux.HandleFunc("/api/upload-reference/", handleUploadReference(store, outputsDir))
+	mux.HandleFunc("/api/reference/", handleReferenceImage(store, outputsDir))
+	mux.HandleFunc("/api/optimize-scene", handleOptimizeScene(store, originalsDir, outputsDir))
 	mux.HandleFunc("/api/status", handleStatus(blenderInfo))
+	mux.HandleFunc("/api/settings/", handleSettings(store, settingsDir))
 	mux.HandleFunc("/api/preview/", handlePreview(store, originalsDir, outputsDir))
+	mux.HandleFunc("/api/analytics/event", handleAnalyticsEvent(analyticsLogger))
+	mux.HandleFunc("/api/analytics/start-session", handleAnalyticsStartSession(analyticsLogger))
+	mux.HandleFunc("/api/profiles", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			handleProfilesList(profilesDir)(w, r)
+		case http.MethodPost:
+			handleProfileSave(profilesDir)(w, r)
+		default:
+			jsonError(w, http.StatusMethodNotAllowed, "method not allowed")
+		}
+	})
+	mux.HandleFunc("/api/profiles/", handleProfile(profilesDir))
+	mux.HandleFunc("/api/accept/", handleAccept(store, settingsDir, acceptedDir, acceptedThumbsDir, analyticsLogger))
 
 	// Serve embedded static files
 	staticFS, _ := fs.Sub(staticFiles, "static")
@@ -133,7 +161,7 @@ func main() {
 }
 
 // scanExistingFiles loads file state from disk on startup.
-func scanExistingFiles(store *FileStore, originalsDir, outputsDir string) {
+func scanExistingFiles(store *FileStore, originalsDir, outputsDir, settingsDir, acceptedDir string) {
 	entries, err := os.ReadDir(originalsDir)
 	if err != nil {
 		return
@@ -161,6 +189,20 @@ func scanExistingFiles(store *FileStore, originalsDir, outputsDir string) {
 			record.Status = StatusDone
 			record.OutputSize = outInfo.Size()
 		}
+
+		record.HasSavedSettings = SettingsExist(id, settingsDir)
+		if record.HasSavedSettings {
+			// T-005-02: also surface whether the on-disk settings
+			// diverge from defaults so the file list can render a
+			// "tuned" indicator without an extra round trip. Errors
+			// are intentionally swallowed: a corrupt settings file
+			// should not block the scan, and SettingsDirty=false is
+			// the right conservative default.
+			if s, err := LoadSettings(id, settingsDir); err == nil {
+				record.SettingsDirty = SettingsDifferFromDefaults(s)
+			}
+		}
+		record.IsAccepted = AcceptedExists(id, acceptedDir)
 
 		store.Add(record)
 	}
