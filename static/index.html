@@ -24,7 +24,8 @@
             <div class="file-list" id="fileList"></div>
 
             <div class="panel-actions">
-                <button class="btn btn-primary" id="processAllBtn" disabled>Process All</button>
+                <!-- T-008-02: "Process All" removed. Per-asset prep now flows
+                     through the toolbar's "Prepare for scene" primary action. -->
                 <button class="btn btn-secondary" id="downloadAllBtn" style="display:none">Download All (.zip)</button>
             </div>
         </div>
@@ -41,36 +42,59 @@
                     <button data-lod="lod1" disabled>LOD1</button>
                     <button data-lod="lod2" disabled>LOD2</button>
                     <button data-lod="lod3" disabled>LOD3</button>
-                    <button data-lod="billboard" disabled>Billboard</button>
-                    <button data-lod="volumetric" disabled>Volumetric</button>
-                    <button data-lod="production" disabled>Production</button>
-                    <button data-lod="vlod0" disabled>VL0</button>
-                    <button data-lod="vlod1" disabled>VL1</button>
-                    <button data-lod="vlod2" disabled>VL2</button>
-                    <button data-lod="vlod3" disabled>VL3</button>
+                    <button data-lod="billboard" disabled>Camera-facing</button>
+                    <button data-lod="billboard-tilted" disabled>Tilted</button>
+                    <button data-lod="volumetric" disabled>Dome slices</button>
+                    <button data-lod="production" disabled>Hybrid</button>
+                    <button data-lod="vlod0" disabled>Vol high</button>
+                    <button data-lod="vlod1" disabled>Vol med</button>
+                    <button data-lod="vlod2" disabled>Vol low</button>
+                    <button data-lod="vlod3" disabled>Vol billboard</button>
                 </div>
                 <button class="wireframe-toggle" id="wireframeBtn">Wireframe</button>
                 <div class="toolbar-actions">
-                    <button class="toolbar-btn" id="generateLodsBtn" disabled>LODs (gltfpack)</button>
-                    <button class="toolbar-btn toolbar-btn-blender" id="generateBlenderLodsBtn" disabled style="display:none">LODs (Blender)</button>
-                    <button class="toolbar-btn" id="generateBillboardBtn" disabled>Billboard</button>
-                    <button class="toolbar-btn" id="generateVolumetricBtn" disabled>Volumetric</button>
-                    <button class="toolbar-btn" id="generateVolumetricLodsBtn" disabled>Vol LODs</button>
-                    <button class="toolbar-btn" id="generateProductionBtn" disabled title="Generate billboard + volumetric hybrid asset">Production Asset</button>
+                    <button class="toolbar-btn toolbar-btn-primary" id="prepareForSceneBtn" disabled title="Run the full pipeline: optimize, classify, LOD, hybrid impostor">Prepare for scene</button>
+                    <!-- T-008-02: every direct technique button lives behind this
+                         disclosure. Collapsed by default; user expands for direct
+                         access. The bake-stale hint and progress block stay
+                         outside the disclosure so they remain visible. -->
+                    <details class="toolbar-advanced">
+                        <summary class="toolbar-btn">Advanced</summary>
+                        <div class="advanced-panel">
+                            <button class="toolbar-btn" id="generateLodsBtn" disabled title="Build a discrete LOD chain with gltfpack (engine-friendly mesh decimation)">Build LOD chain</button>
+                            <button class="toolbar-btn toolbar-btn-blender" id="generateBlenderLodsBtn" disabled style="display:none" title="Build a LOD chain via Blender voxel remesh (slower, better for organic shapes)">Build LOD chain (Blender remesh)</button>
+                            <button class="toolbar-btn" id="generateBillboardBtn" disabled title="Build a multi-angle camera-facing impostor (cheapest distant render)">Build camera-facing impostor</button>
+                            <button class="toolbar-btn" id="generateVolumetricBtn" disabled title="Build a stack of horizontal dome slices (better top-down look)">Build volumetric dome slices</button>
+                            <button class="toolbar-btn" id="generateVolumetricLodsBtn" disabled title="Build a chain of progressively coarser dome-slice variants">Build volumetric LOD chain</button>
+                            <button class="toolbar-btn" id="generateProductionBtn" disabled title="Build a hybrid impostor: camera-facing for low angles, dome slices for top-down">Build hybrid impostor</button>
+                            <button class="toolbar-btn" id="buildPackBtn" disabled title="Combine the three intermediates into a single dist/plants/{species}.glb pack">Build Asset Pack</button>
+                            <button class="toolbar-btn" id="testLightingBtn" disabled title="Diagnostic: render a test scene and report pixel brightness">Run lighting diagnostic</button>
+                        </div>
+                    </details>
                     <span id="bakeStaleHint" class="bake-stale-hint" style="display:none" title="The on-disk baked textures still reflect the previous lighting preset. Regenerate to apply the new preset.">Bake out of date — regenerate to apply preset</span>
-                    <button class="toolbar-btn" id="uploadReferenceBtn" disabled title="Upload a reference image to calibrate scene lighting">Reference Image</button>
+                    <!-- T-008-02: hidden file input retained — the in-tuning-panel
+                         "Upload reference image" button (T-007-03) reuses it. -->
                     <input type="file" id="referenceFileInput" accept="image/png,image/jpeg" hidden>
-                    <button class="toolbar-btn" id="testLightingBtn" disabled title="Diagnostic: render a test scene and report pixel brightness">Test Lighting</button>
+                </div>
+                <!-- T-008-01: Prepare for scene progress + post-run "View in scene" affordance.
+                     Hidden until the first click; stays visible between runs so the user can see
+                     the most recent outcome. -->
+                <div class="prepare-progress" id="prepareProgress" style="display:none">
+                    <ul class="prepare-stages" id="prepareStages"></ul>
+                    <div class="prepare-error" id="prepareError"></div>
+                    <button class="toolbar-btn" id="viewInSceneBtn" style="display:none">View in scene</button>
                 </div>
                 <div class="stress-controls">
+                    <label class="stress-label">Scene:</label>
+                    <select id="sceneTemplateSelect" class="scene-select" title="Scene preview template"></select>
                     <label class="stress-label">Count:</label>
-                    <input type="range" id="stressCount" min="1" max="100" value="1" class="stress-slider">
-                    <span id="stressCountValue" class="stress-value">1x</span>
+                    <input type="number" id="sceneInstanceCount" min="1" max="500" value="100" class="scene-count" title="Instance count (container template clamps to 5-10)">
+                    <label class="stress-label"><input type="checkbox" id="sceneGroundToggle"> Ground</label>
                     <label class="stress-label"><input type="checkbox" id="stressUseLods"> LOD</label>
                     <label class="stress-label" id="lodQualityLabel" style="display:none">Quality:</label>
                     <input type="range" id="lodQuality" min="0" max="100" value="50" class="stress-slider" style="display:none;width:60px" title="Higher = more high-detail instances">
                     <span id="lodQualityValue" class="stress-value" style="display:none">50%</span>
-                    <button class="wireframe-toggle" id="stressBtn">Run</button>
+                    <button class="wireframe-toggle" id="stressBtn">Run scene</button>
                 </div>
             </div>
             <div class="preview-stats" id="previewStats" style="display:none">
@@ -87,7 +111,22 @@
             </div>
             <canvas id="preview-canvas" style="display:none"></canvas>
             <div class="preview-placeholder" id="previewPlaceholder">
-                Select or drop a file to preview
+                <!-- T-008-03: first-run hint shown when the workspace has no
+                     assets. app.js#updatePlaceholderState toggles between
+                     #firstRunHint and #placeholderFallback based on the
+                     file-list state and a session-sticky "dismissed" flag. -->
+                <div class="first-run-hint" id="firstRunHint">
+                    <h2>Get started</h2>
+                    <ol>
+                        <li><strong>Drop a .glb file</strong> on the left, or click <strong>Browse Files</strong>.</li>
+                        <li>Click <strong>Prepare for scene</strong> above the preview once the file loads.</li>
+                        <li><strong>Tune by eye</strong> from the right-hand panel if it doesn't look right.</li>
+                        <li>Mark it <strong>Accepted</strong> when you're happy with the result.</li>
+                    </ol>
+                </div>
+                <div class="placeholder-fallback" id="placeholderFallback" style="display:none">
+                    Select or drop a file to preview
+                </div>
             </div>
         </div>
 
@@ -218,17 +257,17 @@
             </div>
 
             <div class="settings-section" id="tuningSection">
-                <h3>Tuning <span class="dirty-dot" id="tuningDirtyDot"></span></h3>
+                <h3>Asset tuning <span class="dirty-dot" id="tuningDirtyDot"></span></h3>
 
-                <div class="setting-row">
-                    <label>Volumetric layers
+                <div class="setting-row" data-help-id="tuneVolumetricLayers">
+                    <label>Dome layer count
                         <span class="range-value" id="tuneVolumetricLayersValue">4</span>
                     </label>
                     <input type="range" id="tuneVolumetricLayers" min="1" max="12" step="1" value="4">
                 </div>
 
-                <div class="setting-row">
-                    <label>Volumetric resolution</label>
+                <div class="setting-row" data-help-id="tuneVolumetricResolution">
+                    <label>Bake texture size</label>
                     <select id="tuneVolumetricResolution">
                         <option value="256">256</option>
                         <option value="512" selected>512</option>
@@ -236,71 +275,92 @@
                     </select>
                 </div>
 
-                <div class="setting-row">
-                    <label>Dome height factor
+                <div class="setting-row" data-help-id="tuneDomeHeightFactor">
+                    <label>Dome height
                         <span class="range-value" id="tuneDomeHeightFactorValue">0.50</span>
                     </label>
                     <input type="range" id="tuneDomeHeightFactor" min="0" max="1" step="0.01" value="0.5">
                 </div>
 
-                <div class="setting-row">
-                    <label>Bake exposure
+                <div class="setting-row" data-help-id="tuneBakeExposure">
+                    <label>Bake brightness
                         <span class="range-value" id="tuneBakeExposureValue">1.00</span>
                     </label>
                     <input type="range" id="tuneBakeExposure" min="0.5" max="2.5" step="0.01" value="1.0">
                 </div>
 
-                <div class="setting-row">
-                    <label>Ambient intensity
+                <div class="setting-row" data-help-id="tuneAmbientIntensity">
+                    <label>Ambient light
                         <span class="range-value" id="tuneAmbientIntensityValue">0.50</span>
                     </label>
                     <input type="range" id="tuneAmbientIntensity" min="0" max="2" step="0.01" value="0.5">
                 </div>
 
-                <div class="setting-row">
-                    <label>Hemisphere intensity
+                <div class="setting-row" data-help-id="tuneHemisphereIntensity">
+                    <label>Sky light
                         <span class="range-value" id="tuneHemisphereIntensityValue">1.00</span>
                     </label>
                     <input type="range" id="tuneHemisphereIntensity" min="0" max="2" step="0.01" value="1.0">
                 </div>
 
-                <div class="setting-row">
-                    <label>Key light intensity
+                <div class="setting-row" data-help-id="tuneKeyLightIntensity">
+                    <label>Sun strength
                         <span class="range-value" id="tuneKeyLightIntensityValue">1.40</span>
                     </label>
                     <input type="range" id="tuneKeyLightIntensity" min="0" max="3" step="0.01" value="1.4">
                 </div>
 
-                <div class="setting-row">
-                    <label>Bottom fill intensity
+                <div class="setting-row" data-help-id="tuneBottomFillIntensity">
+                    <label>Underside fill
                         <span class="range-value" id="tuneBottomFillIntensityValue">0.40</span>
                     </label>
                     <input type="range" id="tuneBottomFillIntensity" min="0" max="1.5" step="0.01" value="0.4">
                 </div>
 
-                <div class="setting-row">
-                    <label>Env map intensity
+                <div class="setting-row" data-help-id="tuneEnvMapIntensity">
+                    <label>Reflection strength
                         <span class="range-value" id="tuneEnvMapIntensityValue">1.20</span>
                     </label>
                     <input type="range" id="tuneEnvMapIntensity" min="0" max="3" step="0.01" value="1.2">
                 </div>
 
-                <div class="setting-row">
-                    <label>Alpha test
+                <div class="setting-row" data-help-id="tuneAlphaTest">
+                    <label>Cutout edge threshold
                         <span class="range-value" id="tuneAlphaTestValue">0.10</span>
                     </label>
                     <input type="range" id="tuneAlphaTest" min="0" max="0.5" step="0.005" value="0.1">
                 </div>
 
-                <div class="setting-row">
+                <div class="setting-row" data-help-id="tuneTiltedFadeLowStart">
+                    <label>Tilted fade-in start
+                        <span class="range-value" id="tuneTiltedFadeLowStartValue">0.30</span>
+                    </label>
+                    <input type="range" id="tuneTiltedFadeLowStart" min="0" max="1" step="0.01" value="0.30">
+                </div>
+
+                <div class="setting-row" data-help-id="tuneTiltedFadeLowEnd">
+                    <label>Tilted fade-in end
+                        <span class="range-value" id="tuneTiltedFadeLowEndValue">0.55</span>
+                    </label>
+                    <input type="range" id="tuneTiltedFadeLowEnd" min="0" max="1" step="0.01" value="0.55">
+                </div>
+
+                <div class="setting-row" data-help-id="tuneTiltedFadeHighStart">
+                    <label>Tilted fade-out start
+                        <span class="range-value" id="tuneTiltedFadeHighStartValue">0.75</span>
+                    </label>
+                    <input type="range" id="tuneTiltedFadeHighStart" min="0" max="1" step="0.01" value="0.75">
+                </div>
+
+                <div class="setting-row" data-help-id="tuneLightingPreset">
                     <label>Lighting preset</label>
                     <select id="tuneLightingPreset">
                         <!-- Populated at init from static/presets/lighting.js (T-007-01) -->
                     </select>
                 </div>
 
-                <div class="setting-row">
-                    <label>Slice distribution mode</label>
+                <div class="setting-row" data-help-id="tuneSliceDistributionMode">
+                    <label>Slice spacing strategy</label>
                     <select id="tuneSliceDistributionMode">
                         <option value="visual-density">visual-density</option>
                         <option value="vertex-quantile">vertex-quantile</option>
@@ -308,23 +368,23 @@
                     </select>
                 </div>
 
-                <div class="setting-row">
+                <div class="setting-row" data-help-id="tuneGroundAlign">
                     <div class="checkbox-row">
                         <input type="checkbox" id="tuneGroundAlign">
-                        <label for="tuneGroundAlign">Ground align bottom slice</label>
+                        <label for="tuneGroundAlign">Snap bottom slice to ground</label>
                     </div>
                 </div>
 
-                <div class="setting-row" id="referenceImageRow" style="display:none">
+                <div class="setting-row" id="referenceImageRow" data-help-id="tuneReferenceImageBtn" style="display:none">
                     <button class="preset-btn" id="tuneReferenceImageBtn">Upload reference image</button>
                 </div>
 
-                <div class="setting-row">
+                <div class="setting-row" data-help-id="tuneReclassifyBtn">
                     <button class="preset-btn" id="tuneReclassifyBtn">Reclassify…</button>
                     <span id="tuneShapeCategoryHint" class="shape-hint"></span>
                 </div>
 
-                <div class="setting-row">
+                <div class="setting-row" data-help-id="tuneResetBtn">
                     <button class="preset-btn" id="tuneResetBtn">Reset to defaults</button>
                 </div>
             </div>

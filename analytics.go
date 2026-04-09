@@ -34,6 +34,8 @@ var validEventTypes = map[string]bool{
 	"classification":  true, // T-004-02
 	"strategy_selected": true, // T-004-03
 	"classification_override": true, // T-004-04
+	"scene_template_selected": true, // T-006-02
+	"prepare_for_scene": true, // T-008-01
 }
 
 // Event is the canonical envelope for a tuning analytics event. Each event

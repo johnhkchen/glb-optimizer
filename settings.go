@@ -30,10 +30,45 @@ type AssetSettings struct {
 	BottomFillIntensity  float64 `json:"bottom_fill_intensity"`
 	EnvMapIntensity      float64 `json:"env_map_intensity"`
 	AlphaTest             float64 `json:"alpha_test"`
+	// T-009-03: tunable fade-band thresholds for the three-state
+	// (horizontal → tilted → dome) crossfade in the Production
+	// hybrid preview. All in [0,1] of |dot(camDir, -Y)|. Marked
+	// omitempty so legacy on-disk JSON written before T-009-03
+	// loads cleanly with zeros; the JS loader normalizes zeros to
+	// the makeDefaults values.
+	TiltedFadeLowStart    float64 `json:"tilted_fade_low_start,omitempty"`
+	TiltedFadeLowEnd      float64 `json:"tilted_fade_low_end,omitempty"`
+	TiltedFadeHighStart   float64 `json:"tilted_fade_high_start,omitempty"`
 	LightingPreset        string  `json:"lighting_preset"`
 	SliceDistributionMode string  `json:"slice_distribution_mode"`
 	GroundAlign           bool    `json:"ground_align"`
 	ReferenceImagePath    string  `json:"reference_image_path,omitempty"`
+	// ShapeCategory is the S-004 taxonomy class returned by the shape
+	// classifier. Populated by /api/classify/:id (or auto on upload),
+	// not by the user. Empty string on disk is normalized to "unknown"
+	// at load time. Added in T-004-02.
+	ShapeCategory   string  `json:"shape_category,omitempty"`
+	// ShapeConfidence is the classifier's confidence in ShapeCategory,
+	// in [0,1]. Zero on a freshly uploaded, never-classified asset.
+	ShapeConfidence float64 `json:"shape_confidence,omitempty"`
+	// SliceAxis is the bake-time slicing axis chosen by the S-004
+	// strategy router (T-004-03). One of "y", "auto-horizontal",
+	// "auto-thin". Populated when the asset is classified; the user
+	// may override via the tuning UI. Empty string on disk is
+	// normalized to "y" at load time.
+	SliceAxis string `json:"slice_axis,omitempty"`
+	// SceneTemplateId is the active scene-preview template id from the
+	// T-006-02 picker. One of the keys in validSceneTemplates. Empty
+	// string on disk is normalized to "grid" at load time.
+	SceneTemplateId string `json:"scene_template_id,omitempty"`
+	// SceneInstanceCount is the per-asset instance count for the scene
+	// preview. Range [1,500]. Zero on disk is normalized to 100 at
+	// load time.
+	SceneInstanceCount int `json:"scene_instance_count,omitempty"`
+	// SceneGroundPlane is whether the optional ground plane is shown
+	// under the scene preview. Default false; the Go zero value is
+	// the migration default so no normalization is needed.
+	SceneGroundPlane bool `json:"scene_ground_plane,omitempty"`
 }
 
 // DefaultSettings returns the canonical v1 defaults. These match the
@@ -51,11 +86,33 @@ func DefaultSettings() *AssetSettings {
 		BottomFillIntensity:  0.4,
 		EnvMapIntensity:      1.2,
 		AlphaTest:             0.10,
+		TiltedFadeLowStart:    0.30,
+		TiltedFadeLowEnd:      0.55,
+		TiltedFadeHighStart:   0.75,
 		LightingPreset:        "default",
 		SliceDistributionMode: "visual-density",
 		GroundAlign:           true,
 		ReferenceImagePath:    "",
+		ShapeCategory:         "unknown",
+		ShapeConfidence:       0,
+		SliceAxis:             "y",
+		SceneTemplateId:       "grid",
+		SceneInstanceCount:    100,
+		SceneGroundPlane:      false,
 	}
+}
+
+// validShapeCategories enumerates the S-004 shape taxonomy. The set is
+// closed; the classifier returns one of these or "unknown" when it has
+// no opinion. T-004-03's strategy router treats "unknown" as "use the
+// default strategy".
+var validShapeCategories = map[string]bool{
+	"round-bush":   true,
+	"directional":  true,
+	"tall-narrow":  true,
+	"planar":       true,
+	"hard-surface": true,
+	"unknown":      true,
 }
 
 // validResolutions enumerates the allowed values for VolumetricResolution.
@@ -84,6 +141,28 @@ var validSliceDistributionModes = map[string]bool{
 	"equal-height":    true,
 	"vertex-quantile": true,
 	"visual-density":  true,
+}
+
+// validSliceAxes enumerates the allowed values for SliceAxis. The
+// "auto-*" sentinels are resolved to a concrete X/Y/Z axis at bake
+// time against the model bounding box. Hard-surface assets persist
+// SliceAxis="y" because they do not slice; the bake ignores the
+// field for hard-surface. Added in T-004-03.
+var validSliceAxes = map[string]bool{
+	"y":               true,
+	"auto-horizontal": true,
+	"auto-thin":       true,
+}
+
+// validSceneTemplates enumerates the scene-preview template ids
+// shipped in T-006-02. Lives JS-side as the keys of SCENE_TEMPLATES
+// in static/app.js; this set is the persistence allow-list.
+var validSceneTemplates = map[string]bool{
+	"grid":        true,
+	"hedge-row":   true,
+	"mixed-bed":   true,
+	"rock-garden": true,
+	"container":   true,
 }
 
 // Validate checks the AssetSettings against the v1 schema. It returns the
@@ -122,12 +201,37 @@ func (s *AssetSettings) Validate() error {
 	if err := checkRange("alpha_test", s.AlphaTest, 0, 1); err != nil {
 		return err
 	}
+	if err := checkRange("tilted_fade_low_start", s.TiltedFadeLowStart, 0, 1); err != nil {
+		return err
+	}
+	if err := checkRange("tilted_fade_low_end", s.TiltedFadeLowEnd, 0, 1); err != nil {
+		return err
+	}
+	if err := checkRange("tilted_fade_high_start", s.TiltedFadeHighStart, 0, 1); err != nil {
+		return err
+	}
 	if !validLightingPresets[s.LightingPreset] {
 		return fmt.Errorf("lighting_preset %q is not a known preset", s.LightingPreset)
 	}
 	if !validSliceDistributionModes[s.SliceDistributionMode] {
 		return fmt.Errorf("slice_distribution_mode %q is not a known mode", s.SliceDistributionMode)
 	}
+	if !validShapeCategories[s.ShapeCategory] {
+		return fmt.Errorf("shape_category %q is not a known category", s.ShapeCategory)
+	}
+	if err := checkRange("shape_confidence", s.ShapeConfidence, 0, 1); err != nil {
+		return err
+	}
+	if !validSliceAxes[s.SliceAxis] {
+		return fmt.Errorf("slice_axis %q is not a known axis", s.SliceAxis)
+	}
+	if !validSceneTemplates[s.SceneTemplateId] {
+		return fmt.Errorf("scene_template_id %q is not a known template", s.SceneTemplateId)
+	}
+	if s.SceneInstanceCount < 1 || s.SceneInstanceCount > 500 {
+		return fmt.Errorf("scene_instance_count out of range [1,500]: %d", s.SceneInstanceCount)
+	}
+	// SceneGroundPlane is a bool; both values are valid.
 	// GroundAlign is a bool; both values are valid.
 	// ReferenceImagePath is a free string; empty means "not set".
 	return nil
@@ -163,7 +267,13 @@ func SettingsDifferFromDefaults(s *AssetSettings) bool {
 		s.LightingPreset != d.LightingPreset ||
 		s.SliceDistributionMode != d.SliceDistributionMode ||
 		s.GroundAlign != d.GroundAlign ||
-		s.ReferenceImagePath != d.ReferenceImagePath
+		s.ReferenceImagePath != d.ReferenceImagePath ||
+		s.ShapeCategory != d.ShapeCategory ||
+		s.ShapeConfidence != d.ShapeConfidence ||
+		s.SliceAxis != d.SliceAxis ||
+		s.SceneTemplateId != d.SceneTemplateId ||
+		s.SceneInstanceCount != d.SceneInstanceCount ||
+		s.SceneGroundPlane != d.SceneGroundPlane
 }
 
 // SettingsFilePath returns the on-disk path for the given asset id.
@@ -208,6 +318,32 @@ func LoadSettings(id, dir string) (*AssetSettings, error) {
 	// "Forward-compat normalization".
 	if s.SliceDistributionMode == "" {
 		s.SliceDistributionMode = "visual-density"
+	}
+	// Forward-compat for T-004-02: documents written before the shape
+	// classifier landed have no shape_category key. The Go zero ("")
+	// would fail enum validation; "unknown" is the right default and
+	// matches DefaultSettings().
+	if s.ShapeCategory == "" {
+		s.ShapeCategory = "unknown"
+	}
+	// Forward-compat for T-004-03: documents written before the
+	// shape-strategy router landed have no slice_axis key. The Go
+	// zero ("") would fail enum validation; "y" is the right
+	// default and matches DefaultSettings() / pre-T-004-03 bake
+	// behavior.
+	if s.SliceAxis == "" {
+		s.SliceAxis = "y"
+	}
+	// Forward-compat for T-006-02: documents written before the
+	// scene preview picker landed have no scene_* keys. Empty/zero
+	// would fail validation; the defaults are the right migration.
+	// SceneGroundPlane's Go zero (false) IS the migration default,
+	// so no probe is needed.
+	if s.SceneTemplateId == "" {
+		s.SceneTemplateId = "grid"
+	}
+	if s.SceneInstanceCount == 0 {
+		s.SceneInstanceCount = 100
 	}
 	// To distinguish "explicit false" from "absent", re-decode just
 	// ground_align as a *bool. nil → migration default of true.

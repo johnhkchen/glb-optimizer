@@ -385,6 +385,96 @@ body {
     color: #e87d0d;
 }
 
+/* T-008-01: primary action variant for the Prepare-for-scene button. */
+.toolbar-btn-primary {
+    background: var(--accent);
+    color: #fff;
+    border-color: var(--accent);
+    font-weight: 600;
+}
+.toolbar-btn-primary:hover:not(:disabled) {
+    background: var(--accent-hover);
+    border-color: var(--accent-hover);
+    color: #fff;
+}
+.toolbar-btn-primary:disabled {
+    background: #333;
+    color: #666;
+    border-color: #333;
+}
+
+/* T-008-01: progress block rendered next to the Prepare button. One row
+   per stage, color-coded by status. */
+.prepare-progress {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 8px;
+    border-left: 1px solid var(--panel-border);
+    color: var(--text-muted);
+    font-size: 11px;
+}
+.prepare-stages {
+    list-style: none;
+    display: flex;
+    gap: 8px;
+    padding: 0;
+    margin: 0;
+}
+.prepare-stages li { white-space: nowrap; }
+.prepare-stages li.running { color: var(--accent); }
+.prepare-stages li.ok      { color: var(--success); }
+.prepare-stages li.error   { color: var(--error); }
+.prepare-error {
+    color: var(--error);
+    font-size: 11px;
+    max-width: 240px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* T-008-02: Advanced disclosure that hides the technique buttons
+   behind a single summary trigger. The body floats over the
+   preview canvas as a popover so the toolbar row stays one line. */
+.toolbar-advanced {
+    display: inline-block;
+    position: relative;
+}
+.toolbar-advanced > summary {
+    list-style: none;
+    cursor: pointer;
+}
+.toolbar-advanced > summary::-webkit-details-marker {
+    display: none;
+}
+.toolbar-advanced > summary::after {
+    content: ' ▸';
+    font-size: 9px;
+    opacity: 0.7;
+}
+.toolbar-advanced[open] > summary::after {
+    content: ' ▾';
+}
+.advanced-panel {
+    position: absolute;
+    top: calc(100% + 4px);
+    left: 0;
+    z-index: 5;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 8px;
+    background: var(--panel-bg);
+    border: 1px solid var(--panel-border);
+    border-radius: 4px;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+    min-width: 220px;
+}
+.advanced-panel .toolbar-btn {
+    text-align: left;
+}
+
 /* T-007-02: stale-bake hint shown when the user has changed the
    lighting preset since the last successful regenerate. */
 .bake-stale-hint {
@@ -432,6 +522,26 @@ body {
     color: var(--accent);
     font-weight: 600;
     min-width: 32px;
+}
+
+.scene-select {
+    background: var(--panel-bg);
+    color: var(--text);
+    border: 1px solid var(--panel-border);
+    border-radius: 4px;
+    padding: 2px 4px;
+    font-size: 11px;
+    max-width: 140px;
+}
+
+.scene-count {
+    width: 60px;
+    background: var(--panel-bg);
+    color: var(--text);
+    border: 1px solid var(--panel-border);
+    border-radius: 4px;
+    padding: 2px 4px;
+    font-size: 11px;
 }
 
 .fps-overlay {
@@ -507,6 +617,43 @@ body {
     display: flex;
     align-items: center;
     justify-content: center;
+    color: var(--text-muted);
+    font-size: 14px;
+}
+
+/* T-008-03: first-run hint inside the preview placeholder. Shown
+   when the workspace has no assets and hidden permanently for the
+   session as soon as the first asset is uploaded. */
+.first-run-hint {
+    max-width: 380px;
+    color: var(--text-muted);
+    font-size: 13px;
+    line-height: 1.6;
+}
+
+.first-run-hint h2 {
+    font-size: 14px;
+    color: var(--text);
+    margin-bottom: 10px;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+}
+
+.first-run-hint ol {
+    padding-left: 20px;
+}
+
+.first-run-hint li {
+    margin-bottom: 6px;
+}
+
+.first-run-hint strong {
+    color: var(--text);
+    font-weight: 600;
+}
+
+.placeholder-fallback {
     color: var(--text-muted);
     font-size: 14px;
 }

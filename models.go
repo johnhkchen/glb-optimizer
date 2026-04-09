@@ -53,6 +53,7 @@ type FileRecord struct {
 	SettingsUsed *Settings  `json:"settings_used,omitempty"`
 	LODs         []LODLevel `json:"lods,omitempty"`
 	HasBillboard      bool       `json:"has_billboard,omitempty"`
+	HasBillboardTilted bool      `json:"has_billboard_tilted,omitempty"`
 	HasVolumetric     bool       `json:"has_volumetric,omitempty"`
 	VolumetricLODs    []LODLevel `json:"volumetric_lods,omitempty"`
 	VolumetricLODMeta *LODMeta   `json:"volumetric_lod_meta,omitempty"`

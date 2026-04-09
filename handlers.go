@@ -2,6 +2,7 @@ package main
 
 import (
 	"archive/zip"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,8 +10,10 @@ import (
 	"io/fs"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"strconv"
 
@@ -42,7 +45,7 @@ func jsonError(w http.ResponseWriter, status int, msg string) {
 // settings file and emits a "classification" analytics event. Any
 // classifier failure is logged and swallowed; the upload still
 // succeeds with shape_category="unknown".
-func handleUpload(store *FileStore, originalsDir, settingsDir string, logger *AnalyticsLogger) http.HandlerFunc {
+func handleUpload(store *FileStore, originalsDir, settingsDir, uploadsManifestPath string, logger *AnalyticsLogger) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			jsonError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -95,6 +98,20 @@ func handleUpload(store *FileStore, originalsDir, settingsDir string, logger *An
 				Status:       StatusPending,
 			}
 			store.Add(record)
+			// T-012-04: persist <hash> → <original filename> so the
+			// species resolver can recover provenance after a server
+			// restart. Append failures are logged but never propagate
+			// — the upload itself must remain backwards-compatible.
+			if uploadsManifestPath != "" {
+				if mErr := AppendUploadRecord(uploadsManifestPath, UploadManifestEntry{
+					Hash:             id,
+					OriginalFilename: fh.Filename,
+					UploadedAt:       time.Now().UTC(),
+					Size:             written,
+				}); mErr != nil {
+					fmt.Fprintf(os.Stderr, "upload manifest: append failed for %s: %v\n", id, mErr)
+				}
+			}
 			autoClassify(id, originalsDir, settingsDir, store, logger)
 			records = append(records, record)
 		}
@@ -331,6 +348,8 @@ func handlePreview(store *FileStore, originalsDir, outputsDir string) http.Handl
 			filePath = filepath.Join(outputsDir, id+"_"+version+".glb")
 		case "billboard":
 			filePath = filepath.Join(outputsDir, id+"_billboard.glb")
+		case "billboard-tilted":
+			filePath = filepath.Join(outputsDir, id+"_billboard_tilted.glb")
 		case "volumetric":
 			filePath = filepath.Join(outputsDir, id+"_volumetric.glb")
 		case "vlod0", "vlod1", "vlod2", "vlod3":
@@ -461,6 +480,51 @@ func handleUploadBillboard(store *FileStore, outputsDir string) http.HandlerFunc
 	}
 }
 
+// handleUploadBillboardTilted handles POST /api/upload-billboard-tilted/:id.
+// Stores a tilted-camera billboard bake at {outputsDir}/{id}_billboard_tilted.glb.
+// Mirrors handleUploadBillboard exactly — only the file suffix and the
+// FileRecord flag differ. Runtime loading of this variant is T-009-02.
+func handleUploadBillboardTilted(store *FileStore, outputsDir string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			jsonError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+
+		id := strings.TrimPrefix(r.URL.Path, "/api/upload-billboard-tilted/")
+		if _, ok := store.Get(id); !ok {
+			jsonError(w, http.StatusNotFound, "file not found")
+			return
+		}
+
+		body, err := io.ReadAll(io.LimitReader(r.Body, 10<<20)) // 10MB max
+		if err != nil {
+			jsonError(w, http.StatusInternalServerError, "failed to read body")
+			return
+		}
+
+		outputPath := filepath.Join(outputsDir, id+"_billboard_tilted.glb")
+		if err := os.WriteFile(outputPath, body, 0644); err != nil {
+			jsonError(w, http.StatusInternalServerError, "failed to save tilted billboard")
+			return
+		}
+
+		var size int64
+		if info, err := os.Stat(outputPath); err == nil {
+			size = info.Size()
+		}
+
+		store.Update(id, func(r *FileRecord) {
+			r.HasBillboardTilted = true
+		})
+
+		jsonResponse(w, http.StatusOK, map[string]interface{}{
+			"status": "ok",
+			"size":   size,
+		})
+	}
+}
+
 // handleUploadVolumetric handles POST /api/upload-volumetric/:id
 func handleUploadVolumetric(store *FileStore, outputsDir string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -499,6 +563,35 @@ func handleUploadVolumetric(store *FileStore, outputsDir string) http.HandlerFun
 		jsonResponse(w, http.StatusOK, map[string]interface{}{
 			"status": "ok",
 			"size":   volumetricSize,
+		})
+	}
+}
+
+// handleBakeComplete handles POST /api/bake-complete/:id. The bake
+// driver (static/app.js generateProductionAsset) calls this once
+// after all three impostor uploads succeed. The handler stamps
+// {outputsDir}/{id}_bake.json with a fresh RFC3339 UTC timestamp;
+// pack_meta_capture later reads that stamp so combine runs of the
+// same intermediates produce identical bake_ids. See T-011-03.
+func handleBakeComplete(store *FileStore, outputsDir string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			jsonError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+		id := strings.TrimPrefix(r.URL.Path, "/api/bake-complete/")
+		if _, ok := store.Get(id); !ok {
+			jsonError(w, http.StatusNotFound, "file not found")
+			return
+		}
+		bakeID, err := WriteBakeStamp(outputsDir, id)
+		if err != nil {
+			jsonError(w, http.StatusInternalServerError, "failed to write bake stamp")
+			return
+		}
+		jsonResponse(w, http.StatusOK, map[string]interface{}{
+			"status":  "ok",
+			"bake_id": bakeID,
 		})
 	}
 }
@@ -607,6 +700,7 @@ func handleDeleteFile(store *FileStore, originalsDir, outputsDir string) http.Ha
 		os.Remove(filepath.Join(outputsDir, id+"_lod2.glb"))
 		os.Remove(filepath.Join(outputsDir, id+"_lod3.glb"))
 		os.Remove(filepath.Join(outputsDir, id+"_billboard.glb"))
+		os.Remove(filepath.Join(outputsDir, id+"_billboard_tilted.glb"))
 		os.Remove(filepath.Join(outputsDir, id+"_volumetric.glb"))
 		os.Remove(filepath.Join(outputsDir, id+"_vlod0.glb"))
 		os.Remove(filepath.Join(outputsDir, id+"_vlod1.glb"))
@@ -680,27 +774,42 @@ func handleSettings(store *FileStore, settingsDir string) http.HandlerFunc {
 }
 
 // applyShapeStrategyToSettings stamps the strategy router's defaults
-// onto the asset's settings, but only for fields that are still at
-// their factory default. The user-override semantics are: if the
-// user has tuned a strategy-shaped field away from defaults, the
-// classification leaves their value alone; otherwise the strategy
-// fills it in. Slice fields carrying the SliceAxisNA sentinel
-// (hard-surface routes to the parametric pipeline) are skipped
-// entirely. Added in T-004-03.
-func applyShapeStrategyToSettings(s *AssetSettings, strategy ShapeStrategy) {
+// onto the asset's settings.
+//
+// `force` controls override semantics:
+//
+//   - force=false (auto-classify path): only stamps fields that are
+//     still at their factory default. If the user has tuned a
+//     strategy-shaped field away from defaults, leave it alone. This
+//     is what we want when the upload pipeline silently re-runs the
+//     classifier — user tuning survives a re-upload.
+//
+//   - force=true (explicit override path): unconditionally overwrites
+//     strategy-shaped fields with the new category's defaults. This
+//     is what we want when the user explicitly picks a category in
+//     the comparison UI — the previous strategy's stamping (which
+//     was itself an auto-stamp, not a real user choice) must NOT
+//     survive the override or the bake will keep using the wrong
+//     slice axis / distribution / layer count.
+//
+// Slice fields carrying the SliceAxisNA sentinel (hard-surface routes
+// to the parametric pipeline) are skipped entirely either way.
+// Added in T-004-03; force flag added as a follow-up to fix the
+// reclassify-stuck bug.
+func applyShapeStrategyToSettings(s *AssetSettings, strategy ShapeStrategy, force bool) {
 	d := DefaultSettings()
 	if strategy.SliceAxis != SliceAxisNA && strategy.SliceAxis != "" {
-		if s.SliceAxis == d.SliceAxis {
+		if force || s.SliceAxis == d.SliceAxis {
 			s.SliceAxis = strategy.SliceAxis
 		}
 	}
 	if strategy.SliceDistributionMode != SliceAxisNA && strategy.SliceDistributionMode != "" {
-		if s.SliceDistributionMode == d.SliceDistributionMode {
+		if force || s.SliceDistributionMode == d.SliceDistributionMode {
 			s.SliceDistributionMode = strategy.SliceDistributionMode
 		}
 	}
 	if strategy.SliceCount > 0 {
-		if s.VolumetricLayers == d.VolumetricLayers {
+		if force || s.VolumetricLayers == d.VolumetricLayers {
 			s.VolumetricLayers = strategy.SliceCount
 		}
 	}
@@ -712,14 +821,14 @@ func applyShapeStrategyToSettings(s *AssetSettings, strategy ShapeStrategy) {
 // strategy router's defaults onto any still-default strategy-shaped
 // fields (T-004-03), validates, and writes atomically. Returns the
 // new settings on success.
-func applyClassificationToSettings(id, settingsDir string, result *ClassificationResult) (*AssetSettings, error) {
+func applyClassificationToSettings(id, settingsDir string, result *ClassificationResult, force bool) (*AssetSettings, error) {
 	s, err := LoadSettings(id, settingsDir)
 	if err != nil {
 		return nil, fmt.Errorf("load settings: %w", err)
 	}
 	s.ShapeCategory = result.Category
 	s.ShapeConfidence = result.Confidence
-	applyShapeStrategyToSettings(s, getStrategyForCategory(result.Category))
+	applyShapeStrategyToSettings(s, getStrategyForCategory(result.Category), force)
 	if err := s.Validate(); err != nil {
 		return nil, fmt.Errorf("validate settings: %w", err)
 	}
@@ -872,7 +981,7 @@ func autoClassify(id, originalsDir, settingsDir string, store *FileStore, logger
 		fmt.Fprintf(os.Stderr, "autoClassify %s: %v\n", id, err)
 		return
 	}
-	s, err := applyClassificationToSettings(id, settingsDir, result)
+	s, err := applyClassificationToSettings(id, settingsDir, result, false)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "autoClassify %s: %v\n", id, err)
 		return
@@ -938,7 +1047,12 @@ func handleClassify(store *FileStore, originalsDir, settingsDir string, logger *
 			result.Category = override
 			result.Confidence = 1.0
 		}
-		s, err := applyClassificationToSettings(id, settingsDir, result)
+		// force=isOverride: when the user explicitly picks a category in
+		// the comparison UI (or via the manual reclassify button), we
+		// MUST overwrite the previously-stamped strategy fields. The
+		// auto-classify path keeps force=false so user tunings survive
+		// silent re-uploads.
+		s, err := applyClassificationToSettings(id, settingsDir, result, isOverride)
 		if err != nil {
 			jsonError(w, http.StatusInternalServerError, err.Error())
 			return
@@ -1609,6 +1723,272 @@ func handleAccept(
 
 		default:
 			jsonError(w, http.StatusMethodNotAllowed, "method not allowed")
+		}
+	}
+}
+
+// blenderRenderMu serializes Blender production renders (one at a time).
+var blenderRenderMu sync.Mutex
+
+// blenderRenderTimeout is the maximum duration for a single Blender production render.
+const blenderRenderTimeout = 300 * time.Second
+
+// buildProductionConfig is the JSON shape written to the temp config file
+// for render_production.py's --config flag.
+type buildProductionConfig struct {
+	Source                string  `json:"source"`
+	OutputDir             string  `json:"output_dir"`
+	ID                    string  `json:"id"`
+	Category              string  `json:"category"`
+	Resolution            int     `json:"resolution"`
+	BillboardAngles       int     `json:"billboard_angles"`
+	TiltedElevation       float64 `json:"tilted_elevation"`
+	VolumetricLayers      int     `json:"volumetric_layers"`
+	VolumetricResolution  int     `json:"volumetric_resolution"`
+	SliceDistributionMode string  `json:"slice_distribution_mode"`
+	SliceAxis             string  `json:"slice_axis"`
+	DomeHeightFactor      float64 `json:"dome_height_factor"`
+	AlphaTest             float64 `json:"alpha_test"`
+	GroundAlign           bool    `json:"ground_align"`
+	BakeExposure          float64 `json:"bake_exposure"`
+	AmbientIntensity      float64 `json:"ambient_intensity"`
+	HemisphereIntensity   float64 `json:"hemisphere_intensity"`
+	KeyLightIntensity     float64 `json:"key_light_intensity"`
+	BottomFillIntensity   float64 `json:"bottom_fill_intensity"`
+	EnvMapIntensity       float64 `json:"env_map_intensity"`
+	SkipBillboard         bool    `json:"skip_billboard,omitempty"`
+	SkipTilted            bool    `json:"skip_tilted,omitempty"`
+	SkipVolumetric        bool    `json:"skip_volumetric,omitempty"`
+}
+
+// handleBuildProduction handles POST /api/build-production/{id}?category={cat}.
+// Invokes Blender headlessly to render production impostor intermediates.
+func handleBuildProduction(
+	store *FileStore,
+	settingsDir, outputsDir string,
+	blender BlenderInfo,
+	renderScriptPath string,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			jsonError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+
+		if !blender.Available {
+			jsonError(w, http.StatusInternalServerError, "blender not installed")
+			return
+		}
+
+		// Check that the render script exists.
+		if _, err := os.Stat(renderScriptPath); err != nil {
+			jsonError(w, http.StatusInternalServerError, "render script not found: "+renderScriptPath)
+			return
+		}
+
+		id := strings.TrimPrefix(r.URL.Path, "/api/build-production/")
+		if id == "" {
+			jsonError(w, http.StatusBadRequest, "missing asset id")
+			return
+		}
+
+		rec, ok := store.Get(id)
+		if !ok {
+			jsonError(w, http.StatusNotFound, "asset not found")
+			return
+		}
+		if rec.Status != StatusDone {
+			jsonError(w, http.StatusBadRequest, "asset must be optimized first (status=done)")
+			return
+		}
+
+		// Resolve category: query param > saved settings > "unknown".
+		category := r.URL.Query().Get("category")
+		settings, err := LoadSettings(id, settingsDir)
+		if err != nil {
+			jsonError(w, http.StatusInternalServerError, "failed to load settings: "+err.Error())
+			return
+		}
+		if category == "" {
+			category = settings.ShapeCategory
+		}
+		if category == "" {
+			category = "unknown"
+		}
+
+		strategy := getStrategyForCategory(category)
+
+		// Determine what to render. hard-surface skips volumetric.
+		skipVolumetric := strategy.SliceAxis == SliceAxisNA || strategy.SliceCount == 0
+
+		// Build config.
+		cfg := buildProductionConfig{
+			Source:                filepath.Join(outputsDir, id+".glb"),
+			OutputDir:             outputsDir,
+			ID:                    id,
+			Category:              category,
+			Resolution:            settings.VolumetricResolution,
+			BillboardAngles:       6, // production-render-params.md constant
+			TiltedElevation:       30.0,
+			VolumetricLayers:      strategy.SliceCount,
+			VolumetricResolution:  settings.VolumetricResolution,
+			SliceDistributionMode: strategy.SliceDistributionMode,
+			SliceAxis:             strategy.SliceAxis,
+			DomeHeightFactor:      settings.DomeHeightFactor,
+			AlphaTest:             settings.AlphaTest,
+			GroundAlign:           settings.GroundAlign,
+			BakeExposure:          settings.BakeExposure,
+			AmbientIntensity:      settings.AmbientIntensity,
+			HemisphereIntensity:   settings.HemisphereIntensity,
+			KeyLightIntensity:     settings.KeyLightIntensity,
+			BottomFillIntensity:   settings.BottomFillIntensity,
+			EnvMapIntensity:       settings.EnvMapIntensity,
+			SkipVolumetric:        skipVolumetric,
+		}
+
+		// Write temp config file.
+		configPath := filepath.Join(outputsDir, id+"_render_config.json")
+		configData, err := json.MarshalIndent(cfg, "", "  ")
+		if err != nil {
+			jsonError(w, http.StatusInternalServerError, "failed to marshal config: "+err.Error())
+			return
+		}
+		if err := os.WriteFile(configPath, configData, 0644); err != nil {
+			jsonError(w, http.StatusInternalServerError, "failed to write config: "+err.Error())
+			return
+		}
+		defer os.Remove(configPath)
+
+		// Run Blender with timeout.
+		start := time.Now()
+
+		blenderRenderMu.Lock()
+		defer blenderRenderMu.Unlock()
+
+		ctx, cancel := context.WithTimeout(r.Context(), blenderRenderTimeout)
+		defer cancel()
+
+		cmd := exec.CommandContext(ctx, blender.Path, "-b", "--python", renderScriptPath, "--", "--config", configPath)
+		if blender.ResourceDir != "" {
+			cmd.Env = append(os.Environ(), "BLENDER_SYSTEM_RESOURCES="+blender.ResourceDir)
+		}
+
+		output, err := cmd.CombinedOutput()
+		duration := time.Since(start)
+
+		if err != nil {
+			if ctx.Err() == context.DeadlineExceeded {
+				jsonError(w, http.StatusInternalServerError, "render timed out after 300s")
+				return
+			}
+			// Truncate stderr to 2KB for the error response.
+			msg := string(output)
+			if len(msg) > 2048 {
+				msg = msg[:2048]
+			}
+			jsonError(w, http.StatusInternalServerError, msg)
+			return
+		}
+
+		// Verify intermediate files exist.
+		expectedBillboard := filepath.Join(outputsDir, id+"_billboard.glb")
+		expectedTilted := filepath.Join(outputsDir, id+"_billboard_tilted.glb")
+		expectedVolumetric := filepath.Join(outputsDir, id+"_volumetric.glb")
+
+		hasBillboard := fileExists(expectedBillboard)
+		hasTilted := fileExists(expectedTilted)
+		hasVolumetric := !skipVolumetric && fileExists(expectedVolumetric)
+
+		var missing []string
+		if !hasBillboard {
+			missing = append(missing, "billboard")
+		}
+		if !hasTilted {
+			missing = append(missing, "billboard_tilted")
+		}
+		if !skipVolumetric && !hasVolumetric {
+			missing = append(missing, "volumetric")
+		}
+		if len(missing) > 0 {
+			jsonError(w, http.StatusInternalServerError,
+				"blender completed but intermediates missing: "+strings.Join(missing, ", "))
+			return
+		}
+
+		// Update FileStore.
+		store.Update(id, func(r *FileRecord) {
+			r.HasBillboard = hasBillboard
+			r.HasBillboardTilted = hasTilted
+			r.HasVolumetric = hasVolumetric
+		})
+
+		jsonResponse(w, http.StatusOK, map[string]interface{}{
+			"id":          id,
+			"billboard":   hasBillboard,
+			"tilted":      hasTilted,
+			"volumetric":  hasVolumetric,
+			"duration_ms": duration.Milliseconds(),
+		})
+	}
+}
+
+// handleBuildPack handles POST /api/pack/:id. Reads the three baked
+// intermediates from outputsDir for the asset, assembles a PackMeta
+// via BuildPackMetaFromBake (T-011-02), runs CombinePack (T-010-02),
+// and writes the result to distDir/{species}.glb.
+//
+// Status codes:
+//   200 — success, JSON body { pack_path, size, species }
+//   400 — required side intermediate missing or PackMeta build failed
+//   404 — no FileRecord for id
+//   413 — combine returned the 5 MiB cap error
+//   500 — any other read / combine / write failure
+func handleBuildPack(
+	store *FileStore,
+	originalsDir, settingsDir, outputsDir, distDir string,
+) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			jsonError(w, http.StatusMethodNotAllowed, "method not allowed")
+			return
+		}
+
+		id := strings.TrimPrefix(r.URL.Path, "/api/pack/")
+		if id == "" || strings.Contains(id, "/") {
+			jsonError(w, http.StatusNotFound, "file not found")
+			return
+		}
+		if _, ok := store.Get(id); !ok {
+			jsonError(w, http.StatusNotFound, "file not found")
+			return
+		}
+
+		// T-010-04: the read → build-meta → combine → write logic
+		// lives in pack_runner.RunPack so the CLI subcommand can
+		// share it. The handler's job is the URL/HTTP envelope and
+		// translating PackResult.Status into status codes.
+		result := RunPack(id, originalsDir, settingsDir, outputsDir, distDir, store, ResolverOptions{})
+		switch result.Status {
+		case "ok":
+			jsonResponse(w, http.StatusOK, map[string]interface{}{
+				"pack_path": filepath.Join(distDir, result.Species+".glb"),
+				"size":      result.Size,
+				"species":   result.Species,
+			})
+		case "missing-source":
+			jsonError(w, http.StatusBadRequest,
+				"missing intermediate: build the hybrid impostor first")
+		case "oversize":
+			jsonError(w, http.StatusRequestEntityTooLarge, result.Err.Error())
+		default:
+			// Preserve the legacy "build meta:" → 400 mapping. Any
+			// other failure (read, combine, write) is a 500.
+			msg := result.Err.Error()
+			if strings.HasPrefix(msg, "build meta:") {
+				jsonError(w, http.StatusBadRequest, msg)
+				return
+			}
+			jsonError(w, http.StatusInternalServerError, msg)
 		}
 	}
 }

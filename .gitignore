@@ -35,9 +35,15 @@ go.work.sum
 # Downloaded archives
 *.zip
 
+# Built asset packs (USB drop source — never committed)
+dist/
+
 # Lisa tooling
 .lisa.toml
 .lisa/
 
 # Claude memory
 .claude/
+
+# Node deps for scripts/verify-pack.mjs (committed package-lock pins them)
+scripts/node_modules/

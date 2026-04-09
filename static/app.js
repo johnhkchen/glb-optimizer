@@ -11,6 +11,7 @@ import {
     listLightingPresets,
     PRESET_FIELD_MAP,
 } from './presets/lighting.js';
+import { HELP_TEXT } from './help_text.js';
 
 // ── State ──
 let files = [];
@@ -35,13 +36,21 @@ let referencePalette = null; // { bright, mid, dark } colors used to tint bake l
 let bakeStale = false; // T-007-02: set true when preset changes after last regenerate
 let currentSettings = null; // per-asset bake/tuning settings, populated by selectFile()
 let _saveSettingsTimer = null; // debounce handle for saveSettings()
+let groundPlane = null; // T-006-02: optional brown ground plane mesh
+// T-008-03: sticky session flag — flips to true on the first
+// non-empty file list and never flips back, so the first-run hint
+// stays hidden after the user uploads (even if they delete every
+// file later in the same session).
+let firstRunHintDismissed = false;
 
 // ── DOM refs ──
 const dropZone = document.getElementById('dropZone');
 const browseBtn = document.getElementById('browseBtn');
 const fileInput = document.getElementById('fileInput');
 const fileList = document.getElementById('fileList');
-const processAllBtn = document.getElementById('processAllBtn');
+// T-008-02: processAllBtn removed from the UI; per-asset prep now
+// flows through prepareForScene. The /api/process-all route stays
+// reachable from devtools/curl for ad-hoc batch use.
 const downloadAllBtn = document.getElementById('downloadAllBtn');
 const previewToolbar = document.getElementById('previewToolbar');
 const previewCanvas = document.getElementById('preview-canvas');
@@ -59,10 +68,23 @@ const generateBillboardBtn = document.getElementById('generateBillboardBtn');
 const generateVolumetricBtn = document.getElementById('generateVolumetricBtn');
 const generateVolumetricLodsBtn = document.getElementById('generateVolumetricLodsBtn');
 const generateProductionBtn = document.getElementById('generateProductionBtn');
-const uploadReferenceBtn = document.getElementById('uploadReferenceBtn');
+const buildPackBtn = document.getElementById('buildPackBtn');
+// T-008-02: the toolbar #uploadReferenceBtn was removed. The hidden
+// #referenceFileInput stays — it is still triggered by the
+// in-tuning-panel "Upload reference image" button (T-005-03/T-007-03).
 const referenceFileInput = document.getElementById('referenceFileInput');
 const testLightingBtn = document.getElementById('testLightingBtn');
 const generateBlenderLodsBtn = document.getElementById('generateBlenderLodsBtn');
+// T-008-01: Prepare-for-scene primary action + progress block.
+const prepareForSceneBtn = document.getElementById('prepareForSceneBtn');
+const prepareProgress    = document.getElementById('prepareProgress');
+const prepareStages      = document.getElementById('prepareStages');
+const prepareError       = document.getElementById('prepareError');
+const viewInSceneBtn     = document.getElementById('viewInSceneBtn');
+// T-006-02: scene preview picker, instance count input, ground toggle.
+const sceneTemplateSelect = document.getElementById('sceneTemplateSelect');
+const sceneInstanceCount = document.getElementById('sceneInstanceCount');
+const sceneGroundToggle = document.getElementById('sceneGroundToggle');
 
 const simplificationSlider = document.getElementById('simplification');
 const simplificationValue = document.getElementById('simplificationValue');
@@ -90,11 +112,24 @@ async function loadSettings(id) {
         const res = await fetch(`/api/settings/${id}`);
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         currentSettings = await res.json();
+        normalizeTiltedFadeFields(currentSettings);
     } catch (err) {
         console.warn(`loadSettings(${id}) failed, using defaults:`, err);
         applyDefaults();
     }
     return currentSettings;
+}
+
+// T-009-03: Legacy on-disk settings written before T-009-03 don't have
+// the three tilted-fade fields; the Go side marshals them as zero with
+// `omitempty`. Backfill any missing/zero value with the canonical
+// makeDefaults so the live preview math doesn't degenerate to a hard
+// cut at lookDown=0.
+function normalizeTiltedFadeFields(s) {
+    if (!s) return;
+    if (!s.tilted_fade_low_start)  s.tilted_fade_low_start  = 0.30;
+    if (!s.tilted_fade_low_end)    s.tilted_fade_low_end    = 0.55;
+    if (!s.tilted_fade_high_start) s.tilted_fade_high_start = 0.75;
 }
 
 function saveSettings(id) {
@@ -130,16 +165,25 @@ function makeDefaults() {
         bottom_fill_intensity: 0.4,
         env_map_intensity: 1.2,
         alpha_test: 0.10,
+        // T-009-03: tunable thresholds for the three-state production
+        // crossfade. Mirror DefaultSettings() in settings.go.
+        tilted_fade_low_start: 0.30,
+        tilted_fade_low_end: 0.55,
+        tilted_fade_high_start: 0.75,
         lighting_preset: 'default',
         slice_distribution_mode: 'visual-density',
         slice_axis: 'y',
         ground_align: true,
         reference_image_path: '',
+        scene_template_id: 'grid',
+        scene_instance_count: 100,
+        scene_ground_plane: false,
     };
 }
 
 function applyDefaults() {
     currentSettings = makeDefaults();
+    populateScenePreviewUI();
     return currentSettings;
 }
 
@@ -147,6 +191,37 @@ function applyDefaults() {
 // Populate the lighting preset dropdown from the registry. Idempotent;
 // safe to call more than once. The select is intentionally empty in
 // index.html so this function is the single source of truth.
+// T-006-02: populate the scene preview <select> from SCENE_TEMPLATES.
+// Adding a template to the registry doesn't require HTML changes.
+// Idempotent; safe to call more than once.
+function populateScenePreviewSelect() {
+    if (!sceneTemplateSelect) return;
+    sceneTemplateSelect.innerHTML = '';
+    for (const id of Object.keys(SCENE_TEMPLATES)) {
+        const opt = document.createElement('option');
+        opt.value = id;
+        opt.textContent = SCENE_TEMPLATES[id].name;
+        sceneTemplateSelect.appendChild(opt);
+    }
+}
+
+// T-006-02: hydrate the picker / count input / ground toggle from
+// currentSettings, and apply them to JS state (active template id,
+// ground plane visibility). Called from selectFile (after
+// loadSettings) and from applyDefaults so cold-start state is
+// populated before any user interaction.
+function populateScenePreviewUI() {
+    if (!currentSettings) return;
+    const tplId = currentSettings.scene_template_id || 'grid';
+    const count = currentSettings.scene_instance_count || 100;
+    const ground = !!currentSettings.scene_ground_plane;
+    if (sceneTemplateSelect) sceneTemplateSelect.value = tplId;
+    if (sceneInstanceCount) sceneInstanceCount.value = count;
+    if (sceneGroundToggle) sceneGroundToggle.checked = ground;
+    setSceneTemplate(tplId);
+    if (groundPlane) groundPlane.visible = ground;
+}
+
 function populateLightingPresetSelect() {
     const sel = document.getElementById('tuneLightingPreset');
     if (!sel) return;
@@ -183,8 +258,12 @@ function applyLightingPreset(id) {
     currentSettings.lighting_preset = preset.id;
     populateTuningUI();
     // T-007-02: refresh the live three.js scene lights and mark the
-    // on-disk bake as stale until the user regenerates.
+    // on-disk bake as stale until the user regenerates. The follow-up
+    // applyTuningToLiveScene call applies per-slider intensity values
+    // on top of the preset's color tinting so the live preview matches
+    // the slider state immediately.
     applyPresetToLiveScene();
+    applyTuningToLiveScene();
     setBakeStale(true);
     // T-007-03: the `from-reference-image` preset id is the new
     // discriminator for reference-image calibration. Picking it (or
@@ -347,13 +426,26 @@ window.logEvent = logEvent;
 // of validShapeCategories. Used by renderCandidateThumbnail to
 // temporarily mutate currentSettings before each candidate bake.
 const STRATEGY_TABLE = {
-    'round-bush':   { slice_axis: 'y',               slice_distribution_mode: 'visual-density', volumetric_layers: 4 },
-    'directional':  { slice_axis: 'auto-horizontal', slice_distribution_mode: 'equal-height',   volumetric_layers: 4 },
-    'tall-narrow':  { slice_axis: 'y',               slice_distribution_mode: 'equal-height',   volumetric_layers: 6 },
-    'planar':       { slice_axis: 'auto-thin',       slice_distribution_mode: 'equal-height',   volumetric_layers: 3 },
-    'hard-surface': { slice_axis: 'n/a',             slice_distribution_mode: 'n/a',             volumetric_layers: 0 },
-    'unknown':      { slice_axis: 'y',               slice_distribution_mode: 'visual-density', volumetric_layers: 4 },
+    'round-bush':   { slice_axis: 'y',               slice_distribution_mode: 'visual-density', volumetric_layers: 4, instance_orientation_rule: 'random-y' },
+    'directional':  { slice_axis: 'auto-horizontal', slice_distribution_mode: 'equal-height',   volumetric_layers: 4, instance_orientation_rule: 'fixed' },
+    'tall-narrow':  { slice_axis: 'y',               slice_distribution_mode: 'equal-height',   volumetric_layers: 6, instance_orientation_rule: 'random-y' },
+    'planar':       { slice_axis: 'auto-thin',       slice_distribution_mode: 'equal-height',   volumetric_layers: 3, instance_orientation_rule: 'aligned-to-row' },
+    'hard-surface': { slice_axis: 'n/a',             slice_distribution_mode: 'n/a',             volumetric_layers: 0, instance_orientation_rule: 'fixed' },
+    'unknown':      { slice_axis: 'y',               slice_distribution_mode: 'visual-density', volumetric_layers: 4, instance_orientation_rule: 'random-y' },
 };
+
+// T-004-05: derive whether stress-test instances should get a random
+// per-instance Y rotation, from the strategy router's
+// instance_orientation_rule. `fixed` (directional, hard-surface) and
+// `aligned-to-row` (planar, eventually controlled per-row by S-006)
+// both want every instance pointing the same way. Anything else
+// (including unknown / missing) falls back to the historical
+// random-y behavior so the rose / round-bush case is unchanged.
+function shouldRandomRotateInstances() {
+    const cat = currentSettings && currentSettings.shape_category;
+    const rule = (STRATEGY_TABLE[cat] && STRATEGY_TABLE[cat].instance_orientation_rule) || 'random-y';
+    return rule !== 'fixed' && rule !== 'aligned-to-row';
+}
 
 const COMPARISON_THUMB_SIZE = 256;
 const COMPARISON_AUTO_THRESHOLD = 0.7;
@@ -622,6 +714,12 @@ const TUNING_SPEC = [
     { field: 'bottom_fill_intensity', id: 'tuneBottomFillIntensity',  parse: parseFloat,           fmt: v => v.toFixed(2) },
     { field: 'env_map_intensity',     id: 'tuneEnvMapIntensity',      parse: parseFloat,           fmt: v => v.toFixed(2) },
     { field: 'alpha_test',            id: 'tuneAlphaTest',            parse: parseFloat,           fmt: v => v.toFixed(3) },
+    // T-009-03: tunable thresholds for the three-state production
+    // crossfade (horizontal → tilted → dome). Auto-instrumented for
+    // setting_changed analytics by wireTuningUI.
+    { field: 'tilted_fade_low_start',  id: 'tuneTiltedFadeLowStart',  parse: parseFloat,           fmt: v => v.toFixed(2) },
+    { field: 'tilted_fade_low_end',    id: 'tuneTiltedFadeLowEnd',    parse: parseFloat,           fmt: v => v.toFixed(2) },
+    { field: 'tilted_fade_high_start', id: 'tuneTiltedFadeHighStart', parse: parseFloat,           fmt: v => v.toFixed(2) },
     { field: 'lighting_preset',       id: 'tuneLightingPreset',       parse: v => v,               fmt: v => v },
     // T-005-01: enrolled for setting_changed analytics. DOM ids are
     // reserved here so the auto-instrumentation in wireTuningUI picks
@@ -691,6 +789,12 @@ function wireTuningUI() {
             if (valEl) valEl.textContent = spec.fmt(v);
             updateTuningDirty();
             saveSettings(selectedFileId);
+            // Real-time live-preview feedback. Schedule via rAF so we
+            // batch into the next animation frame instead of running
+            // synchronously inside the input handler — this avoids
+            // any chance of the lights/materials being mutated mid-
+            // frame during a wheel/orbit interaction.
+            scheduleLiveTuningRefresh();
             // Auto-instrumentation: fire setting_changed alongside the
             // debounced PUT. ms_since_prev is the gap from the previous
             // setting_changed in this session (null on the first one),
@@ -1148,30 +1252,8 @@ function store_update(id, fn) {
 
 window._processFile = processFile;
 
-async function processAll() {
-    const settings = getSettings();
-    processAllBtn.disabled = true;
-    processAllBtn.textContent = 'Processing...';
-    files.forEach(f => { if (f.status === 'pending') f.status = 'processing'; });
-    renderFileList();
-    try {
-        const res = await fetch('/api/process-all', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(settings),
-        });
-        const results = await res.json();
-        if (Array.isArray(results)) {
-            for (const r of results) {
-                const idx = files.findIndex(f => f.id === r.id);
-                if (idx !== -1) files[idx] = r;
-            }
-        }
-    } catch (err) { console.error('Process all failed:', err); }
-    processAllBtn.textContent = 'Process All';
-    renderFileList();
-    updatePreviewButtons();
-}
+// T-008-02: processAll() removed along with the left-panel button.
+// The /api/process-all route is still mounted server-side.
 
 async function deleteFile(id) {
     try { await fetch(`/api/files/${id}`, { method: 'DELETE' }); } catch (err) { console.error(err); }
@@ -1185,7 +1267,7 @@ window._deleteFile = deleteFile;
 // ── LOD Generation ──
 async function generateLODs(id) {
     const settings = getSettings();
-    generateLodsBtn.textContent = 'Generating...';
+    generateLodsBtn.textContent = 'Building…';
     generateLodsBtn.classList.add('generating');
     generateLodsBtn.disabled = true;
     try {
@@ -1199,13 +1281,13 @@ async function generateLODs(id) {
         if (idx !== -1) files[idx] = result;
         updatePreviewButtons();
     } catch (err) { console.error('LOD generation failed:', err); }
-    generateLodsBtn.textContent = 'LODs (gltfpack)';
+    generateLodsBtn.textContent = 'Build LOD chain';
     generateLodsBtn.classList.remove('generating');
     generateLodsBtn.disabled = false;
 }
 
 async function generateBlenderLODs(id) {
-    generateBlenderLodsBtn.textContent = 'Remeshing...';
+    generateBlenderLodsBtn.textContent = 'Building…';
     generateBlenderLodsBtn.classList.add('generating');
     generateBlenderLodsBtn.disabled = true;
     try {
@@ -1220,19 +1302,26 @@ async function generateBlenderLODs(id) {
         renderFileList();
         updatePreviewButtons();
     } catch (err) { console.error('Blender LOD generation failed:', err); }
-    generateBlenderLodsBtn.textContent = 'LODs (Blender)';
+    generateBlenderLodsBtn.textContent = 'Build LOD chain (Blender remesh)';
     generateBlenderLodsBtn.classList.remove('generating');
     generateBlenderLodsBtn.disabled = false;
 }
 
 // ── Billboard Impostor Generation ──
 const BILLBOARD_ANGLES = 6; // render from 6 evenly-spaced angles
+// T-009-01: Tilted-camera billboard bake. Side variants only — uses an
+// elevated viewing angle so the runtime (T-009-02) can crossfade
+// between horizontal sides, top-down, and these tilted sides as the
+// camera pitches up.
+const TILTED_BILLBOARD_ANGLES        = 6;
+const TILTED_BILLBOARD_ELEVATION_RAD = Math.PI / 6; // 30°
+const TILTED_BILLBOARD_RESOLUTION    = 512;
 let billboardVariants = []; // stored { geometry, material, quadWidth, quadHeight } per angle
 
 async function generateBillboard(id) {
     if (!currentModel || !threeReady) return;
 
-    generateBillboardBtn.textContent = 'Rendering...';
+    generateBillboardBtn.textContent = 'Building…';
     generateBillboardBtn.classList.add('generating');
     generateBillboardBtn.disabled = true;
 
@@ -1254,12 +1343,53 @@ async function generateBillboard(id) {
         logEvent('regenerate', { trigger: 'billboard', success }, id);
     }
 
-    generateBillboardBtn.textContent = 'Billboard';
+    generateBillboardBtn.textContent = 'Build camera-facing impostor';
     generateBillboardBtn.classList.remove('generating');
     generateBillboardBtn.disabled = false;
 }
 
-function renderBillboardAngle(model, angleRad, resolution) {
+// T-009-01: Tilted-camera billboard bake. Devtools-only entry point;
+// no toolbar button this ticket. Bakes N side variants from an
+// elevated camera and uploads the resulting GLB to the new
+// `/api/upload-billboard-tilted/:id` endpoint. Runtime loading +
+// crossfade are T-009-02 / T-009-03.
+async function generateTiltedBillboard(id) {
+    if (!currentModel || !threeReady) return;
+
+    let success = false;
+    try {
+        const glb = await renderTiltedBillboardGLB(
+            currentModel,
+            TILTED_BILLBOARD_ANGLES,
+            TILTED_BILLBOARD_ELEVATION_RAD,
+            TILTED_BILLBOARD_RESOLUTION,
+        );
+        await fetch(`/api/upload-billboard-tilted/${id}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/octet-stream' },
+            body: glb,
+        });
+
+        store_update(id, f => f.has_billboard_tilted = true);
+        updatePreviewButtons();
+        success = true;
+        setBakeStale(false);
+    } catch (err) { console.error('Tilted billboard generation failed:', err); }
+    finally {
+        logEvent('regenerate', { trigger: 'billboard_tilted', success }, id);
+    }
+}
+
+// T-009-01: `elevationRad` defaults to 0, in which case every
+// expression below algebraically reduces to the legacy zero-elevation
+// math (cos(0)=1, sin(0)=0 are exact in IEEE-754, so multiplying by
+// them is a no-op). When elevationRad > 0, the camera is lifted by
+// `dist*sin(elev)` and pulled in horizontally by `dist*cos(elev)`,
+// keeping the radial distance constant so the model's apparent size
+// matches the horizontal bake. The ortho frustum's vertical extent
+// expands to `size.y*cos + maxHoriz*sin` so the rendered silhouette
+// fits the captured quad without stretching at any elevation.
+function renderBillboardAngle(model, angleRad, resolution, elevationRad = 0) {
     // Compute model bounds
     const box = new THREE.Box3().setFromObject(model);
     const center = box.getCenter(new THREE.Vector3());
@@ -1274,16 +1404,21 @@ function renderBillboardAngle(model, angleRad, resolution) {
     offRenderer.toneMappingExposure = currentSettings.bake_exposure;
 
     // Ortho camera sized to fit model
-    const halfH = size.y * 0.55;
-    const halfW = Math.max(size.x, size.z) * 0.55;
+    const cosE = Math.cos(elevationRad);
+    const sinE = Math.sin(elevationRad);
+    const maxHoriz = Math.max(size.x, size.z);
+    const halfH = (size.y * cosE + maxHoriz * sinE) * 0.55;
+    const halfW = maxHoriz * 0.55;
     const offCamera = new THREE.OrthographicCamera(-halfW, halfW, halfH, -halfH, 0.01, maxDim * 10);
 
-    // Position camera around the model at the given angle
+    // Position camera around the model at the given angle. When
+    // elevationRad === 0 this collapses to the legacy horizontal
+    // orbit; otherwise the camera lifts above the model's Y center.
     const dist = maxDim * 2;
     offCamera.position.set(
-        center.x + Math.sin(angleRad) * dist,
-        center.y,
-        center.z + Math.cos(angleRad) * dist
+        center.x + Math.sin(angleRad) * dist * cosE,
+        center.y + dist * sinE,
+        center.z + Math.cos(angleRad) * dist * cosE
     );
     offCamera.lookAt(center);
 
@@ -1415,6 +1550,89 @@ function applyPresetToLiveScene() {
             }
         }
     });
+}
+
+// Real-time tuning feedback: every slider in the right panel writes
+// directly to the live preview's renderer + lights + materials so the
+// user can see what the bake will look like as they drag.
+//
+// Bake-only fields (volumetric_layers, slice_distribution_mode,
+// dome_height_factor, ground_align, color_calibration_mode) cannot be
+// previewed without a re-bake. Those are skipped here; the bake-stale
+// hint is the user's signal that they need to re-run a generate
+// action to see the effect of those settings.
+//
+// applyPresetToLiveScene (T-007-02) sets up the *colors* of each
+// light from the active preset's palette. This function applies the
+// per-slider *intensity* values on top, mutating in place. Order
+// matters: preset first, tuning second, so slider drags override the
+// preset's defaults without losing the preset's color tinting.
+// Coalesce multiple slider input events into a single per-frame apply.
+// Avoids running heavy material/light walks synchronously from inside
+// a slider input listener, which had been suspected of competing with
+// orbit-controls input handling on the same frame.
+let tuningRefreshScheduled = false;
+function scheduleLiveTuningRefresh() {
+    if (tuningRefreshScheduled) return;
+    tuningRefreshScheduled = true;
+    requestAnimationFrame(() => {
+        tuningRefreshScheduled = false;
+        applyTuningToLiveScene();
+    });
+}
+
+function applyTuningToLiveScene() {
+    if (!scene || !renderer || !currentSettings) return;
+
+    // Numeric guard: any undefined / NaN slider value falls back to a
+    // sensible non-zero default rather than propagating NaN through
+    // Three.js's shading equations (NaN intensities can cause black
+    // pixels or worse, depending on the driver).
+    const num = (v, fallback) => (typeof v === 'number' && Number.isFinite(v)) ? v : fallback;
+
+    renderer.toneMappingExposure = num(currentSettings.bake_exposure, 1.0);
+
+    const ambient    = num(currentSettings.ambient_intensity,     0.4);
+    const hemisphere = num(currentSettings.hemisphere_intensity,  0.5);
+    const key        = num(currentSettings.key_light_intensity,   1.4);
+    const fill       = num(currentSettings.bottom_fill_intensity, 0.4);
+
+    // Walk the scene's lights and apply per-role intensity.
+    // Role discrimination matches applyPresetToLiveScene: ambient =
+    // ambient, hemisphere = hemisphere, directional with y<0 = under
+    // fill, directional with x<0 = back/rim (uses key * 0.55 same as
+    // preset path), other directional = main key.
+    scene.traverse((obj) => {
+        if (obj.isAmbientLight) {
+            obj.intensity = ambient;
+        } else if (obj.isHemisphereLight) {
+            obj.intensity = hemisphere;
+        } else if (obj.isDirectionalLight) {
+            if (obj.position.y < 0) {
+                obj.intensity = fill;
+            } else if (obj.position.x < 0) {
+                obj.intensity = key * 0.55;
+            } else {
+                obj.intensity = key;
+            }
+        }
+    });
+
+    // env_map_intensity affects PBR materials on the currently loaded
+    // model. Walk the model and update each PBR material's
+    // envMapIntensity in place. Cheap, no allocations.
+    if (currentModel) {
+        const envIntensity = num(currentSettings.env_map_intensity, 1.2);
+        currentModel.traverse((child) => {
+            if (!child.isMesh || !child.material) return;
+            const mats = Array.isArray(child.material) ? child.material : [child.material];
+            for (const m of mats) {
+                if (m.isMeshStandardMaterial || m.isMeshPhysicalMaterial) {
+                    m.envMapIntensity = envIntensity;
+                }
+            }
+        });
+    }
 }
 
 // T-007-02: Toggle the "bake out of date" hint. Idempotent. The hint
@@ -1645,6 +1863,58 @@ function renderMultiAngleBillboardGLB(model, numAngles) {
     });
 }
 
+// T-009-01: Tilted-bake counterpart of `renderMultiAngleBillboardGLB`.
+// Side variants only — no `billboard_top` quad — captured from an
+// elevated camera (`elevationRad` radians above horizontal). Quad
+// naming is preserved (`billboard_${i}`); the runtime loader (T-009-02)
+// will discriminate by file path, not by quad name.
+function renderTiltedBillboardGLB(model, numAngles, elevationRad, resolution) {
+    return new Promise((resolve, reject) => {
+        const exportScene = new THREE.Scene();
+
+        for (let i = 0; i < numAngles; i++) {
+            const angle = (i / numAngles) * Math.PI * 2;
+            const { canvas, quadWidth, quadHeight } = renderBillboardAngle(model, angle, resolution, elevationRad);
+
+            const texture = new THREE.CanvasTexture(canvas);
+            texture.colorSpace = THREE.SRGBColorSpace;
+
+            const geometry = new THREE.PlaneGeometry(quadWidth, quadHeight);
+            geometry.translate(0, quadHeight / 2, 0); // bottom edge at y=0
+
+            const material = new THREE.MeshBasicMaterial({
+                map: texture,
+                transparent: true,
+                side: THREE.DoubleSide,
+                alphaTest: currentSettings.alpha_test,
+            });
+
+            const quad = new THREE.Mesh(geometry, material);
+            quad.name = `billboard_${i}`;
+            quad.position.set(i * quadWidth * 1.2, 0, 0);
+            exportScene.add(quad);
+        }
+
+        const exporter = new GLTFExporter();
+        exporter.parse(exportScene, (result) => {
+            resolve(result);
+        }, (err) => {
+            reject(err);
+        }, { binary: true });
+    });
+}
+
+// T-009-01: Devtools reach. `app.js` is loaded as a module, so its
+// top-level bindings are not on `window`. Expose the new generator
+// (and a getter for the currently-selected file id) so manual
+// verification can run `await generateTiltedBillboard(selectedFileId)`
+// from the console without source edits.
+window.generateTiltedBillboard = generateTiltedBillboard;
+Object.defineProperty(window, 'selectedFileId', {
+    get() { return selectedFileId; },
+    configurable: true,
+});
+
 // ── Volumetric Distillation (Horizontal Layer Peeling) ──
 // Slices the model into horizontal bands and renders each from above with
 // everything above that band clipped away. The result is stacked horizontal
@@ -1656,7 +1926,7 @@ function renderMultiAngleBillboardGLB(model, numAngles) {
 async function generateVolumetric(id) {
     if (!currentModel || !threeReady) return;
 
-    generateVolumetricBtn.textContent = 'Rendering...';
+    generateVolumetricBtn.textContent = 'Building…';
     generateVolumetricBtn.disabled = true;
 
     let success = false;
@@ -1677,7 +1947,7 @@ async function generateVolumetric(id) {
         logEvent('regenerate', { trigger: 'volumetric', success }, id);
     }
 
-    generateVolumetricBtn.textContent = 'Volumetric';
+    generateVolumetricBtn.textContent = 'Build volumetric dome slices';
     generateVolumetricBtn.disabled = false;
 }
 
@@ -2110,7 +2380,7 @@ const VOLUMETRIC_LOD_CONFIGS = [
 async function generateVolumetricLODs(id) {
     if (!currentModel || !threeReady) return;
 
-    generateVolumetricLodsBtn.textContent = 'Generating...';
+    generateVolumetricLodsBtn.textContent = 'Building…';
     generateVolumetricLodsBtn.classList.add('generating');
     generateVolumetricLodsBtn.disabled = true;
 
@@ -2133,7 +2403,7 @@ async function generateVolumetricLODs(id) {
         logEvent('regenerate', { trigger: 'volumetric_lods', success }, id);
     }
 
-    generateVolumetricLodsBtn.textContent = 'Vol LODs';
+    generateVolumetricLodsBtn.textContent = 'Build volumetric LOD chain';
     generateVolumetricLodsBtn.classList.remove('generating');
     generateVolumetricLodsBtn.disabled = false;
 }
@@ -2141,32 +2411,39 @@ async function generateVolumetricLODs(id) {
 // ── Production Asset (Hybrid) ──
 // One-click generation: billboard for ~horizontal views, volumetric (horizontal
 // dome slices) for top-down views, with crossfade at ~45° in the runtime preview.
-async function generateProductionAsset(id) {
+async function generateProductionAsset(id, onSubstage = () => {}) {
     if (!currentModel || !threeReady) return;
 
-    generateProductionBtn.textContent = 'Rendering...';
+    generateProductionBtn.textContent = 'Rendering via Blender…';
     generateProductionBtn.classList.add('generating');
     generateProductionBtn.disabled = true;
 
+    onSubstage('rendering');
+
     let success = false;
     try {
-        // Billboard pass (multi-angle camera-facing impostor)
-        const billboardGlb = await renderMultiAngleBillboardGLB(currentModel, BILLBOARD_ANGLES);
-        await fetch(`/api/upload-billboard/${id}`, {
+        // T-014-05: single API call replaces three client-side render+upload sequences.
+        const cat = currentSettings && currentSettings.shape_category;
+        const qs = cat ? `?category=${encodeURIComponent(cat)}` : '';
+        const resp = await fetch(`/api/build-production/${id}${qs}`, {
             method: 'POST',
-            headers: { 'Content-Type': 'application/octet-stream' },
-            body: billboardGlb,
         });
-        store_update(id, f => f.has_billboard = true);
 
-        // Volumetric pass (horizontal dome slices, top-down)
-        const volumetricGlb = await renderHorizontalLayerGLB(currentModel, currentSettings.volumetric_layers, currentSettings.volumetric_resolution);
-        await fetch(`/api/upload-volumetric/${id}`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/octet-stream' },
-            body: volumetricGlb,
+        if (!resp.ok) {
+            const body = await resp.json().catch(() => ({}));
+            throw new Error(body.error || `server error ${resp.status}`);
+        }
+
+        const result = await resp.json();
+
+        store_update(id, f => {
+            f.has_billboard = result.billboard;
+            f.has_billboard_tilted = result.tilted;
+            f.has_volumetric = result.volumetric;
         });
-        store_update(id, f => f.has_volumetric = true);
+
+        // T-011-03: stamp bake metadata (server endpoint doesn't do this).
+        await fetch(`/api/bake-complete/${id}`, { method: 'POST' });
 
         await refreshFiles();
         updatePreviewButtons();
@@ -2177,10 +2454,235 @@ async function generateProductionAsset(id) {
         logEvent('regenerate', { trigger: 'production', success }, id);
     }
 
-    generateProductionBtn.textContent = 'Production Asset';
+    generateProductionBtn.textContent = 'Build hybrid impostor';
     generateProductionBtn.classList.remove('generating');
     generateProductionBtn.disabled = false;
 }
+
+// ── Build Asset Pack (T-010-03) ──
+//
+// Wires the existing /api/pack/:id endpoint into the toolbar. The
+// endpoint runs CombinePack against the three intermediates that the
+// "Build hybrid impostor" flow has already uploaded and writes a
+// finished `dist/plants/{species}.glb`.
+//
+// Status / error surfaces:
+//   200 → success line in #prepareError
+//   413 → canonical "Pack exceeds 5 MB" message in #prepareError
+//   any other non-2xx → server's error string in #prepareError
+//
+// We always emit a `pack_built` analytics event, encoding failures
+// as size: 0 — same convention as the existing `regenerate` events.
+async function buildAssetPack(id) {
+    if (!id) return;
+    const file = files.find(f => f.id === id);
+    if (!file) return;
+
+    buildPackBtn.disabled = true;
+    const previousLabel = buildPackBtn.textContent;
+    buildPackBtn.textContent = 'Packing…';
+    buildPackBtn.classList.add('generating');
+    if (prepareError) prepareError.textContent = '';
+
+    let species = '';
+    let size = 0;
+    try {
+        const res = await fetch(`/api/pack/${id}`, { method: 'POST' });
+        let body = null;
+        try { body = await res.json(); } catch (_) { body = null; }
+
+        if (res.ok && body) {
+            species = body.species || '';
+            size = body.size || 0;
+            if (prepareError) {
+                prepareError.textContent = `Pack built: ${species}.glb (${size} bytes)`;
+            }
+        } else if (res.status === 413) {
+            if (prepareError) {
+                prepareError.textContent = 'Pack exceeds 5 MB — reduce variant count or texture resolution and re-bake';
+            }
+        } else {
+            const msg = (body && body.error) ? body.error : `HTTP ${res.status}`;
+            if (prepareError) {
+                prepareError.textContent = `Pack failed: ${msg}`;
+            }
+        }
+    } catch (err) {
+        console.error('Build asset pack failed:', err);
+        if (prepareError) {
+            prepareError.textContent = `Pack failed: ${err.message || err}`;
+        }
+    } finally {
+        logEvent('pack_built', {
+            species,
+            size,
+            has_tilted: !!file.has_billboard_tilted,
+            has_dome:   !!file.has_volumetric,
+        }, id);
+    }
+
+    buildPackBtn.textContent = previousLabel;
+    buildPackBtn.classList.remove('generating');
+    buildPackBtn.disabled = false;
+    updatePreviewButtons();
+}
+
+// ── Prepare for Scene (T-008-01) ──
+//
+// Single primary action that runs the existing pipeline stages in order
+// against the selected asset: gltfpack optimize → classify → LOD chain →
+// production asset (billboard + volumetric). Stops on the first failure.
+// Emits a `prepare_for_scene` analytics event summarizing the run; the
+// underlying functions still emit their own per-stage `regenerate` events.
+//
+// Failure detection: each stage adapter sniffs the file record / settings
+// after the existing function returns, since those functions swallow
+// errors internally and only signal via DOM/store mutations. This is
+// intentionally lightweight per design.md option A.
+
+const PREPARE_STAGES = [
+    { id: 'gltfpack',   label: 'Optimize' },
+    { id: 'classify',   label: 'Classify' },
+    { id: 'lods',       label: 'LOD' },
+    { id: 'production', label: 'Production asset' },
+];
+
+function setPrepareStages(stages) {
+    if (!prepareStages) return;
+    prepareStages.innerHTML = '';
+    for (const s of stages) {
+        const li = document.createElement('li');
+        li.dataset.stage = s.id;
+        li.className = 'pending';
+        li.textContent = `[ ] ${s.label}`;
+        prepareStages.appendChild(li);
+    }
+}
+
+function markPrepareStage(stageId, status, msg) {
+    if (!prepareStages) return;
+    const li = prepareStages.querySelector(`li[data-stage="${stageId}"]`);
+    if (!li) return;
+    const label = PREPARE_STAGES.find(s => s.id === stageId)?.label || stageId;
+    const glyph = status === 'ok' ? '✓' : status === 'error' ? '✗' : status === 'running' ? '•' : ' ';
+    li.className = status;
+    li.textContent = `[${glyph}] ${label}${msg ? ' — ' + msg : ''}`;
+}
+
+async function prepareForScene(id) {
+    if (!id) return;
+    const file = files.find(f => f.id === id);
+    if (!file) return;
+    if (!currentModel) {
+        console.warn('prepareForScene: no currentModel loaded');
+        return;
+    }
+
+    prepareForSceneBtn.disabled = true;
+    const originalLabel = prepareForSceneBtn.textContent;
+    prepareForSceneBtn.textContent = 'Preparing…';
+    prepareProgress.style.display = 'flex';
+    prepareError.textContent = '';
+    viewInSceneBtn.style.display = 'none';
+    setPrepareStages(PREPARE_STAGES);
+
+    const t0 = performance.now();
+    const stagesRun = [];
+    let success = true;
+    let failedStage = null;
+    let failedError = null;
+
+    try {
+        // Stage 1: gltfpack cleanup. Skip if already optimized.
+        {
+            const f = files.find(x => x.id === id);
+            if (f && f.status === 'done') {
+                markPrepareStage('gltfpack', 'ok', 'already optimized');
+            } else {
+                markPrepareStage('gltfpack', 'running');
+                stagesRun.push('gltfpack');
+                await processFile(id);
+                const after = files.find(x => x.id === id);
+                if (!after || after.status !== 'done') {
+                    throw new Error(`gltfpack failed (status: ${after && after.status})`);
+                }
+                markPrepareStage('gltfpack', 'ok');
+            }
+        }
+
+        // Stage 2: classify shape. Skip if already classified.
+        {
+            const conf = currentSettings && currentSettings.shape_confidence;
+            if (conf && conf > 0) {
+                markPrepareStage('classify', 'ok', `${currentSettings.shape_category}`);
+            } else {
+                markPrepareStage('classify', 'running');
+                stagesRun.push('classify');
+                const { settings } = await fetchClassification(id);
+                if (settings) {
+                    currentSettings = settings;
+                    populateTuningUI();
+                }
+                markPrepareStage('classify', 'ok', currentSettings && currentSettings.shape_category);
+            }
+        }
+
+        // Stage 3: LOD chain via gltfpack.
+        {
+            markPrepareStage('lods', 'running');
+            stagesRun.push('lods');
+            await generateLODs(id);
+            const after = files.find(x => x.id === id);
+            const ok = after && Array.isArray(after.lods) && after.lods.length > 0
+                && !after.lods.some(l => l && l.error);
+            if (!ok) throw new Error('LOD generation failed');
+            markPrepareStage('lods', 'ok');
+        }
+
+        // Stage 4: production asset (billboard + tilted billboard + volumetric).
+        {
+            markPrepareStage('production', 'running');
+            stagesRun.push('production');
+            // T-009-03: surface each sub-bake in the running label so
+            // the user sees progress through the three impostor passes.
+            await generateProductionAsset(id, (substage) => {
+                markPrepareStage('production', 'running', `${substage} bake…`);
+            });
+            const after = files.find(x => x.id === id);
+            if (!after || !after.has_billboard || !after.has_billboard_tilted || !after.has_volumetric) {
+                throw new Error('production asset failed');
+            }
+            markPrepareStage('production', 'ok');
+        }
+    } catch (err) {
+        success = false;
+        failedStage = stagesRun[stagesRun.length - 1] || 'unknown';
+        failedError = (err && err.message) || String(err);
+        markPrepareStage(failedStage, 'error', failedError);
+        prepareError.textContent = failedError;
+        console.error('prepareForScene failed:', err);
+    } finally {
+        const totalDurationMs = Math.round(performance.now() - t0);
+        const payload = {
+            stages_run: stagesRun,
+            total_duration_ms: totalDurationMs,
+            success,
+        };
+        if (!success) {
+            payload.failed_stage = failedStage;
+            payload.error = failedError;
+        }
+        logEvent('prepare_for_scene', payload, id);
+
+        prepareForSceneBtn.textContent = originalLabel;
+        prepareForSceneBtn.disabled = !(selectedFileId && currentModel);
+        if (success) {
+            viewInSceneBtn.style.display = '';
+        }
+    }
+}
+
+window.prepareForScene = prepareForScene;
 
 // ── Lighting Diagnostic ──
 // Run a fresh offscreen render with: a known-good red sphere (left half) and
@@ -2762,8 +3264,69 @@ function renderFileList() {
         fileList.appendChild(div);
     }
 
-    processAllBtn.disabled = !hasPending;
     downloadAllBtn.style.display = hasDone ? 'block' : 'none';
+    // T-008-03: keep the first-run hint in sync with the file list.
+    updatePlaceholderState();
+}
+
+// Proportional wheel-zoom handler that integrates deltaY magnitude
+// instead of treating every wheel event as one fixed step. Fixes the
+// "trackpad makes one scroll feel like ten" problem.
+//
+// 5-whys diagnosis (recorded for the next person who hits this):
+//
+//   Q1: Why does one scroll on a trackpad jump the camera so far?
+//   A1: Because OrbitControls' built-in wheel handler treats every
+//       wheel event as one fixed dolly step, regardless of deltaY.
+//
+//   Q2: Why does one physical scroll generate many wheel events?
+//   A2: macOS trackpads emit 30+ wheel events per gesture, each with
+//       a tiny deltaY. Browsers don't coalesce them.
+//
+//   Q3: Why doesn't OrbitControls handle this?
+//   A3: Three.js 0.160's handler was written for line-mode mouse
+//       wheels (one click = one event of deltaY ≈ 100). It only
+//       checks the SIGN of deltaY, never the magnitude.
+//
+//   Q4: Why does lowering controls.zoomSpeed not fix it?
+//   A4: It only changes the per-event proportion. With 30 events
+//       per gesture, even a small per-event factor compounds to a
+//       big total (1.03^30 ≈ 2.4x). The compounding is the problem.
+//
+//   Q5: Why does integrating deltaY fix it?
+//   A5: Sum of deltaY across the 30 micro-events equals the total
+//       physical scroll distance, so a single exponential scaling
+//       on the cumulative deltaY produces a smooth, predictable
+//       per-gesture dolly that's identical regardless of how many
+//       events the OS chooses to fire.
+//
+// Sensitivity is tuned so a normal mouse wheel notch (deltaY ≈ 100)
+// produces a ~10% dolly, matching what users expect from a "click."
+function installProportionalWheelZoom(domElement, cam, ctrls) {
+    const SENSITIVITY = 0.001;       // dolly factor per unit of deltaY
+    const MIN_DISTANCE = 0.05;
+    const MAX_DISTANCE = 5000;
+    const offset = new THREE.Vector3();
+
+    domElement.addEventListener('wheel', (event) => {
+        event.preventDefault();
+        // Capture: true on the listener means we run before any
+        // descendant listeners, but OrbitControls listens on the same
+        // domElement, so we also call stopImmediatePropagation to
+        // make sure its handler does NOT run on the same event.
+        event.stopImmediatePropagation();
+
+        // Exponential scaling so a deltaY of +100 dollies out 10.5%
+        // (factor = e^0.1) and a deltaY of -100 dollies in 9.5%
+        // (factor = e^-0.1). Sums correctly across many small events.
+        const factor = Math.exp(event.deltaY * SENSITIVITY);
+
+        offset.copy(cam.position).sub(ctrls.target).multiplyScalar(factor);
+        const newDist = offset.length();
+        if (newDist < MIN_DISTANCE || newDist > MAX_DISTANCE) return;
+        cam.position.copy(ctrls.target).add(offset);
+        ctrls.update();
+    }, { passive: false, capture: true });
 }
 
 // ── Three.js Setup ──
@@ -2790,6 +3353,18 @@ function initThreeJS() {
     controls = new OrbitControls(camera, previewCanvas);
     controls.enableDamping = true;
     controls.dampingFactor = 0.1;
+    // OrbitControls' built-in wheel handler is broken for trackpad
+    // input: it treats every wheel event as one fixed-size dolly step
+    // regardless of deltaY magnitude. macOS trackpad scrolls generate
+    // 30+ events per gesture, each with a small deltaY, so a single
+    // physical scroll compounds into a huge dolly (1.05^30 ≈ 4.7x).
+    // We disable OrbitControls' zoom and install a custom handler
+    // below that uses deltaY magnitude proportionally — many small
+    // events sum to the same total zoom as one big event.
+    controls.enableZoom = false;
+    controls.minDistance = 0.05;
+    controls.maxDistance = 5000;
+    installProportionalWheelZoom(previewCanvas, camera, controls);
 
     scene.add(new THREE.AmbientLight(0xffffff, 0.4));
     const dirLight = new THREE.DirectionalLight(0xffffff, 1.5);
@@ -2806,6 +3381,22 @@ function initThreeJS() {
 
     scene.add(new THREE.GridHelper(10, 20, 0x2a2a4a, 0x1a1a3e));
 
+    // T-006-02: optional ground plane. Created once, kept hidden by
+    // default, toggled visible by the toolbar checkbox. Uses
+    // MeshStandardMaterial so it picks up the live scene lighting
+    // (consistency with the bake preset, S-007). 100×100 m covers
+    // any practical template footprint.
+    const groundGeom = new THREE.PlaneGeometry(100, 100);
+    const groundMat = new THREE.MeshStandardMaterial({
+        color: 0x6b5544, roughness: 0.95, metalness: 0,
+    });
+    groundPlane = new THREE.Mesh(groundGeom, groundMat);
+    groundPlane.rotation.x = -Math.PI / 2;
+    groundPlane.position.y = 0;
+    groundPlane.visible = false;
+    groundPlane.frustumCulled = false;
+    scene.add(groundPlane);
+
     loader = new GLTFLoader();
     loader.setMeshoptDecoder(MeshoptDecoder);
 
@@ -2815,6 +3406,16 @@ function initThreeJS() {
     loader.setKTX2Loader(ktx2Loader);
 
     threeReady = true;
+    // DEBUG: expose scene state for devtools poking. The module-scope
+    // variables are not on window because this is a module script;
+    // surface them here so console diagnostics are possible.
+    window.__three = {
+        get scene() { return scene; },
+        get camera() { return camera; },
+        get controls() { return controls; },
+        get currentModel() { return currentModel; },
+        get currentSettings() { return currentSettings; },
+    };
     resizeRenderer();
     animate();
 }
@@ -2837,14 +3438,30 @@ function animate() {
     if (controls) controls.update();
     if (renderer && scene && camera) renderer.render(scene, camera);
 
-    // Billboard updates: camera-facing + overhead visibility swap
-    if (stressActive && (billboardInstances.length > 0 || billboardTopInstances.length > 0)) {
-        updateBillboardFacing();
-        updateBillboardVisibility();
-    }
-    // Volumetric slices: in hybrid mode, fade based on camera tilt angle
-    if (stressActive && volumetricInstances.length > 0 && volumetricHybridFade) {
-        updateVolumetricVisibility();
+    // T-009-03: in production-hybrid mode, the four arrays (billboard
+    // side/top, tilted, volumetric) share one unified visibility pass.
+    // Outside that mode, the legacy 2-state crossfades still drive the
+    // standalone Billboard / Tilted / Volumetric preview buttons.
+    if (stressActive && productionHybridFade) {
+        if (billboardInstances.length > 0) updateBillboardFacing();
+        if (tiltedBillboardInstances.length > 0) updateTiltedBillboardFacing();
+        updateHybridVisibility();
+    } else {
+        // Billboard updates: camera-facing + overhead visibility swap
+        if (stressActive && (billboardInstances.length > 0 || billboardTopInstances.length > 0)) {
+            updateBillboardFacing();
+            updateBillboardVisibility();
+        }
+        // T-009-02: tilted-camera billboards have their own facing pass.
+        // Gated separately so we don't run the side/top crossfade against
+        // a tilted set, which has no top quad to fade to.
+        if (stressActive && tiltedBillboardInstances.length > 0) {
+            updateTiltedBillboardFacing();
+        }
+        // Volumetric slices: in hybrid mode, fade based on camera tilt angle
+        if (stressActive && volumetricInstances.length > 0 && volumetricHybridFade) {
+            updateVolumetricVisibility();
+        }
     }
 
     if (stressActive) {
@@ -2876,14 +3493,14 @@ function clearStressInstances() {
     }
     stressInstances = [];
     billboardInstances = [];
+    tiltedBillboardInstances = [];
     billboardTopInstances = [];
     volumetricInstances = [];
     volumetricHybridFade = false;
+    productionHybridFade = false;
     stressActive = false;
     if (currentModel) currentModel.visible = true;
     document.getElementById('fpsOverlay').style.display = 'none';
-    document.getElementById('stressCount').value = 1;
-    document.getElementById('stressCountValue').textContent = '1x';
 }
 
 function getModelStats(model) {
@@ -2936,6 +3553,10 @@ function loadModel(url, fileSize) {
             applyEnvironmentToModel(currentModel);
             scene.add(currentModel);
             frameCamera(currentModel);
+            // Apply the asset's saved env_map_intensity (and any other
+            // material-affecting tuning) on top of the env binding so
+            // a freshly loaded model reflects the slider state.
+            applyTuningToLiveScene();
 
             // Cache original bbox for stress test spacing
             if (previewVersion === 'original') {
@@ -2986,13 +3607,284 @@ function seededRandom(i) {
     return x - Math.floor(x);
 }
 
-function createInstancedFromModel(model, count, positions, randomRotateY = false) {
+// ── Scene Templates (T-006-01) ──
+// Pluggable layout templates for the stress test. Each template
+// produces an array of InstanceSpec — { position, rotationY, scale } —
+// which the placement helpers below consume. The legacy 100x grid is
+// preserved as the `benchmark` template; `debug-scatter` validates
+// the framework with 20 randomly-scattered instances.
+//
+// Note on AC deviation: spec uses scalar `rotationY` (radians) instead
+// of a full Quaternion. Every existing helper only writes Y rotation
+// (dummy.rotation.set(0, y, 0)) and our orientation rules are all
+// Y-axis. Trivial to upgrade to Quaternion later if needed.
+
+function makeInstanceSpec(position, rotationY = 0, scale = 1) {
+    return { position, rotationY, scale };
+}
+
+// scatterRandomly: rejection-sampled random points within an XZ
+// rectangle, with a min-distance constraint. Deterministic per seed.
+// Returns Vector3[] (Y=0). Templates wrap into InstanceSpec.
+function scatterRandomly(boundsXZ, count, seed = 0, minDistance = 0) {
+    const points = [];
+    const minSq = minDistance * minDistance;
+    const w = boundsXZ.maxX - boundsXZ.minX;
+    const d = boundsXZ.maxZ - boundsXZ.minZ;
+    const budget = Math.max(count * 30, 30);
+    let attempt = 0;
+    while (points.length < count && attempt < budget) {
+        const rx = seededRandom(seed * 1000 + attempt * 2);
+        const rz = seededRandom(seed * 1000 + attempt * 2 + 1);
+        attempt++;
+        const x = boundsXZ.minX + rx * w;
+        const z = boundsXZ.minZ + rz * d;
+        let ok = true;
+        if (minSq > 0) {
+            for (const p of points) {
+                const dx = p.x - x, dz = p.z - z;
+                if (dx * dx + dz * dz < minSq) { ok = false; break; }
+            }
+        }
+        if (ok) points.push(new THREE.Vector3(x, 0, z));
+    }
+    if (points.length < count) {
+        console.warn(`scatterRandomly: only placed ${points.length}/${count} points (min-distance too large?)`);
+    }
+    return points;
+}
+
+// scatterInRow: linearly interpolated points between start and end
+// with optional per-axis jitter. Used by row-planted templates
+// (T-006-02). Returns Vector3[].
+function scatterInRow(start, end, count, jitter = 0, seed = 0) {
+    const points = [];
+    for (let i = 0; i < count; i++) {
+        const t = count <= 1 ? 0 : i / (count - 1);
+        const x = start.x + (end.x - start.x) * t;
+        const y = start.y + (end.y - start.y) * t;
+        const z = start.z + (end.z - start.z) * t;
+        const jx = (seededRandom(seed * 7 + i * 2) - 0.5) * jitter * 2;
+        const jz = (seededRandom(seed * 7 + i * 2 + 1) - 0.5) * jitter * 2;
+        points.push(new THREE.Vector3(x + jx, y, z + jz));
+    }
+    return points;
+}
+
+// applyVariation: per-instance scale + position jitter. Mutates and
+// returns the spec array.
+function applyVariation(specs, scaleRange, jitterAmount = 0, seed = 0) {
+    const [smin, smax] = scaleRange;
+    for (let i = 0; i < specs.length; i++) {
+        const s = specs[i];
+        const r = seededRandom(seed * 7919 + i);
+        s.scale = smin + (smax - smin) * r;
+        if (jitterAmount > 0) {
+            const jx = (seededRandom(seed * 7919 + i + 1) - 0.5) * jitterAmount * 2;
+            const jz = (seededRandom(seed * 7919 + i + 2) - 0.5) * jitterAmount * 2;
+            s.position = s.position.clone();
+            s.position.x += jx;
+            s.position.z += jz;
+        }
+    }
+    return specs;
+}
+
+// applyOrientationRule: stamp rotationY on each spec based on the
+// per-shape orientation rule from STRATEGY_TABLE. `random-y` →
+// uniform random, `fixed` → 0, `aligned-to-row` → 0 ± ~5°.
+function applyOrientationRule(specs, rule, seed = 0) {
+    for (let i = 0; i < specs.length; i++) {
+        if (rule === 'random-y') {
+            specs[i].rotationY = seededRandom(seed * 131 + i) * Math.PI * 2;
+        } else if (rule === 'aligned-to-row') {
+            // ±5° (~0.0873 rad) jitter — 0.175 rad peak-to-peak
+            specs[i].rotationY = (seededRandom(seed * 131 + i) - 0.5) * 0.175;
+        } else {
+            // 'fixed' or unknown → no rotation
+            specs[i].rotationY = 0;
+        }
+    }
+    return specs;
+}
+
+// boundsFromSpecs: derive an XZ AABB from an InstanceSpec array.
+// Used for camera framing fallback when a template doesn't return
+// explicit bounds.
+function boundsFromSpecs(specs) {
+    if (!specs || specs.length === 0) {
+        return { minX: 0, maxX: 0, minZ: 0, maxZ: 0, sizeX: 0, sizeZ: 0 };
+    }
+    let minX = Infinity, maxX = -Infinity, minZ = Infinity, maxZ = -Infinity;
+    for (const s of specs) {
+        if (s.position.x < minX) minX = s.position.x;
+        if (s.position.x > maxX) maxX = s.position.x;
+        if (s.position.z < minZ) minZ = s.position.z;
+        if (s.position.z > maxZ) maxZ = s.position.z;
+    }
+    return { minX, maxX, minZ, maxZ, sizeX: maxX - minX, sizeZ: maxZ - minZ };
+}
+
+// SceneTemplate registry. Each entry: { id, name, generate(ctx, count) }.
+// ctx = { bbox, shapeCategory, orientationRule, seed }.
+// T-006-02: five designer-facing templates. The legacy `benchmark`
+// template from T-006-01 lives on as `grid`; `debug-scatter` is
+// removed (it was a framework smoke test, not user-facing).
+function _ctxSize(ctx) {
+    return (ctx.bbox && ctx.bbox.size)
+        ? ctx.bbox.size
+        : new THREE.Vector3(1, 1, 1);
+}
+
+const SCENE_TEMPLATES = {
+    grid: {
+        id: 'grid',
+        name: 'Grid (benchmark)',
+        generate(ctx, count) {
+            const size = _ctxSize(ctx);
+            const spacing = Math.max(size.x, size.z) * 1.3;
+            const cols = Math.ceil(Math.sqrt(count));
+            const rows = Math.ceil(count / cols);
+            const gridW = cols * spacing;
+            const gridD = rows * spacing;
+            const specs = [];
+            for (let i = 0; i < count; i++) {
+                const r = Math.floor(i / cols);
+                const c = i % cols;
+                specs.push(makeInstanceSpec(
+                    new THREE.Vector3(
+                        c * spacing - gridW / 2 + spacing / 2,
+                        0,
+                        r * spacing - gridD / 2 + spacing / 2,
+                    ),
+                ));
+            }
+            applyOrientationRule(specs, ctx.orientationRule, ctx.seed);
+            return specs;
+        },
+    },
+    'hedge-row': {
+        id: 'hedge-row',
+        name: 'Hedge Row',
+        generate(ctx, count) {
+            const size = _ctxSize(ctx);
+            const spacing = Math.max(size.x, size.z) * 1.1;
+            const half = (count - 1) * spacing / 2;
+            const start = new THREE.Vector3(-half, 0, 0);
+            const end = new THREE.Vector3(half, 0, 0);
+            const positions = scatterInRow(start, end, count, 0, ctx.seed);
+            const specs = positions.map(p => makeInstanceSpec(p));
+            // Hedge rows always face the same way — overrides the
+            // shape's orientation rule on purpose.
+            applyOrientationRule(specs, 'fixed', ctx.seed);
+            return specs;
+        },
+    },
+    'mixed-bed': {
+        id: 'mixed-bed',
+        name: 'Mixed Bed',
+        generate(ctx, count) {
+            const size = _ctxSize(ctx);
+            const spread = Math.max(size.x, size.z);
+            const span = spread * Math.sqrt(count) * 1.4;
+            const half = span / 2;
+            const positions = scatterRandomly(
+                { minX: -half, maxX: half, minZ: -half, maxZ: half },
+                count, ctx.seed, spread * 0.9,
+            );
+            const specs = positions.map(p => makeInstanceSpec(p));
+            applyVariation(specs, [0.85, 1.15], 0, ctx.seed);
+            applyOrientationRule(specs, ctx.orientationRule, ctx.seed);
+            return specs;
+        },
+    },
+    'rock-garden': {
+        id: 'rock-garden',
+        name: 'Rock Garden',
+        generate(ctx, count) {
+            const size = _ctxSize(ctx);
+            const spread = Math.max(size.x, size.z);
+            const span = spread * Math.sqrt(count) * 2.2;
+            const half = span / 2;
+            const positions = scatterRandomly(
+                { minX: -half, maxX: half, minZ: -half, maxZ: half },
+                count, ctx.seed, spread * 1.6,
+            );
+            const specs = positions.map(p => makeInstanceSpec(p));
+            applyVariation(specs, [0.7, 1.3], 0, ctx.seed);
+            applyOrientationRule(specs, ctx.orientationRule, ctx.seed);
+            return specs;
+        },
+    },
+    container: {
+        id: 'container',
+        name: 'Container',
+        generate(ctx, count) {
+            // AC clamps the cluster to 5-10 instances. The slider /
+            // input value is honored within that range; outside it,
+            // we silently clamp.
+            const n = Math.max(5, Math.min(10, count));
+            const size = _ctxSize(ctx);
+            const spread = Math.max(size.x, size.z);
+            const half = spread * 1.2; // tight ~2.4× footprint
+            const positions = scatterRandomly(
+                { minX: -half, maxX: half, minZ: -half, maxZ: half },
+                n, ctx.seed, spread * 0.7,
+            );
+            const specs = positions.map(p => makeInstanceSpec(p));
+            applyVariation(specs, [0.9, 1.1], 0, ctx.seed);
+            applyOrientationRule(specs, ctx.orientationRule, ctx.seed);
+            return specs;
+        },
+    },
+};
+
+let activeSceneTemplate = 'grid';
+
+function setSceneTemplate(id) {
+    if (!SCENE_TEMPLATES[id]) {
+        console.warn(`setSceneTemplate: unknown template "${id}". Available:`, Object.keys(SCENE_TEMPLATES));
+        return false;
+    }
+    activeSceneTemplate = id;
+    console.info(`Scene template set to: ${id}`);
+    return true;
+}
+
+function getActiveSceneTemplate() {
+    return activeSceneTemplate;
+}
+
+// Expose hooks so devtools / future picker UI (T-006-02) can drive
+// template selection without grepping the source.
+window.setSceneTemplate = setSceneTemplate;
+window.getActiveSceneTemplate = getActiveSceneTemplate;
+window.__SCENE_TEMPLATES = SCENE_TEMPLATES;
+
+// _isSpecArray: detect whether a placement helper received the new
+// InstanceSpec[] format or the legacy Vector3[] format. Used to keep
+// LOD/production code paths working unchanged on this ticket.
+function _isSpecArray(arr) {
+    return arr.length > 0 && arr[0] && arr[0].position && 'rotationY' in arr[0];
+}
+
+// Third arg accepts either Vector3[] (legacy LOD/production paths) or
+// InstanceSpec[] (new T-006-01 template paths). When given specs,
+// per-instance rotation+scale come from the spec; the legacy
+// `randomRotateY` flag is ignored.
+function createInstancedFromModel(model, count, arr, randomRotateY = false) {
     const meshes = [];
     model.traverse((child) => { if (child.isMesh) meshes.push(child); });
 
     const dummy = new THREE.Object3D();
     const modelInverse = new THREE.Matrix4().copy(model.matrixWorld).invert();
     const created = [];
+    const isSpec = _isSpecArray(arr);
+    const getPos = i => isSpec ? arr[i].position : arr[i];
+    const getRotY = i => isSpec
+        ? arr[i].rotationY
+        : (randomRotateY ? seededRandom(i) * Math.PI * 2 : 0);
+    const getScale = i => isSpec ? arr[i].scale : 1;
 
     for (const mesh of meshes) {
         const instancedMesh = new THREE.InstancedMesh(mesh.geometry, mesh.material, count);
@@ -3000,9 +3892,10 @@ function createInstancedFromModel(model, count, positions, randomRotateY = false
         const localMatrix = new THREE.Matrix4().multiplyMatrices(modelInverse, mesh.matrixWorld.clone());
 
         for (let i = 0; i < count; i++) {
-            dummy.position.copy(positions[i]);
-            dummy.rotation.set(0, randomRotateY ? seededRandom(i) * Math.PI * 2 : 0, 0);
-            dummy.scale.set(1, 1, 1);
+            dummy.position.copy(getPos(i));
+            dummy.rotation.set(0, getRotY(i), 0);
+            const s = getScale(i);
+            dummy.scale.set(s, s, s);
             dummy.updateMatrix();
             instancedMesh.setMatrixAt(i, new THREE.Matrix4().multiplyMatrices(dummy.matrix, localMatrix));
         }
@@ -3016,8 +3909,16 @@ function createInstancedFromModel(model, count, positions, randomRotateY = false
 // Billboard instances that need camera-facing updates each frame
 let billboardInstances = []; // { mesh: InstancedMesh, positions: Vector3[] } — vertical, camera-facing
 let billboardTopInstances = []; // { mesh: InstancedMesh } — horizontal top-down quads
+// T-009-02: tilted-camera billboards. Side-only — the tilted bake has
+// no `billboard_top` quad. Camera-facing in yaw, same math as
+// `billboardInstances`; the tilt is baked into the texture, not the
+// runtime transform.
+let tiltedBillboardInstances = []; // { mesh: InstancedMesh, positions: Vector3[] }
 
-function createBillboardInstances(model, positions) {
+// Second arg accepts either Vector3[] (legacy) or InstanceSpec[]
+// (T-006-01). Spec form preserves per-instance rotation+scale through
+// the variant bucketing.
+function createBillboardInstances(model, arr) {
     // Billboard GLB has N side quads + 1 top-down quad (named 'billboard_top').
     // Side quads: random variant per instance, Y-axis camera facing.
     // Top quad: horizontal, visible when camera is overhead.
@@ -3030,11 +3931,22 @@ function createBillboardInstances(model, positions) {
     });
     if (sideQuads.length === 0) return [];
 
+    const isSpec = _isSpecArray(arr);
+    // Normalize to InstanceSpec[] internally so the per-variant
+    // bucketing carries rotation/scale.
+    const specs = isSpec
+        ? arr
+        : arr.map((p, i) => makeInstanceSpec(
+            p,
+            seededRandom(i + 5555) * Math.PI * 2,
+            1,
+        ));
+
     const numVariants = sideQuads.length;
-    const variantPositions = Array.from({ length: numVariants }, () => []);
-    for (let i = 0; i < positions.length; i++) {
+    const variantSpecs = Array.from({ length: numVariants }, () => []);
+    for (let i = 0; i < specs.length; i++) {
         const variant = Math.floor(seededRandom(i + 9999) * numVariants);
-        variantPositions[variant].push(positions[i]);
+        variantSpecs[variant].push(specs[i]);
     }
 
     const created = [];
@@ -3043,8 +3955,8 @@ function createBillboardInstances(model, positions) {
     // Create side billboard instances (camera-facing)
     // geometry.translate() survives GLTF roundtrip — bottom is already at y=0, no offset needed
     for (let v = 0; v < numVariants; v++) {
-        const posArr = variantPositions[v];
-        if (posArr.length === 0) continue;
+        const bucket = variantSpecs[v];
+        if (bucket.length === 0) continue;
 
         const quad = sideQuads[v];
         const geom = quad.geometry.clone();
@@ -3052,11 +3964,16 @@ function createBillboardInstances(model, positions) {
         mat.depthWrite = true;
         mat.alphaTest = 0.5;
         mat.transparent = false;
-        const instancedMesh = new THREE.InstancedMesh(geom, mat, posArr.length);
+        const instancedMesh = new THREE.InstancedMesh(geom, mat, bucket.length);
         instancedMesh.frustumCulled = false;
 
-        for (let i = 0; i < posArr.length; i++) {
-            dummy.position.copy(posArr[i]);
+        for (let i = 0; i < bucket.length; i++) {
+            dummy.position.copy(bucket[i].position);
+            // Side billboards face the camera at render time — Y
+            // rotation is overwritten by updateBillboardFacing(). We
+            // still write scale here so size variation is preserved.
+            const s = bucket[i].scale;
+            dummy.scale.set(s, s, s);
             dummy.updateMatrix();
             instancedMesh.setMatrixAt(i, dummy.matrix);
         }
@@ -3064,7 +3981,7 @@ function createBillboardInstances(model, positions) {
 
         scene.add(instancedMesh);
         created.push(instancedMesh);
-        billboardInstances.push({ mesh: instancedMesh, positions: posArr });
+        billboardInstances.push({ mesh: instancedMesh, positions: bucket.map(s => s.position) });
     }
 
     // Create top-down instances (horizontal, for overhead view)
@@ -3074,14 +3991,14 @@ function createBillboardInstances(model, positions) {
         topMat.depthWrite = true;
         topMat.alphaTest = 0.5;
         topMat.transparent = false;
-        const topInstancedMesh = new THREE.InstancedMesh(topGeom, topMat, positions.length);
+        const topInstancedMesh = new THREE.InstancedMesh(topGeom, topMat, specs.length);
         topInstancedMesh.frustumCulled = false;
 
-        for (let i = 0; i < positions.length; i++) {
-            dummy.position.copy(positions[i]);
-            // Random Y rotation for variety on the top-down view too
-            dummy.rotation.set(0, seededRandom(i + 5555) * Math.PI * 2, 0);
-            dummy.scale.set(1, 1, 1);
+        for (let i = 0; i < specs.length; i++) {
+            dummy.position.copy(specs[i].position);
+            dummy.rotation.set(0, specs[i].rotationY, 0);
+            const s = specs[i].scale;
+            dummy.scale.set(s, s, s);
             dummy.updateMatrix();
             topInstancedMesh.setMatrixAt(i, dummy.matrix);
         }
@@ -3104,8 +4021,15 @@ function createBillboardInstances(model, positions) {
 // as the camera tilts toward top-down (>45°).
 let volumetricInstances = []; // { mesh: InstancedMesh }[]
 let volumetricHybridFade = false; // when true, fade based on camera angle
+// T-009-03: when true, the four arrays (billboard side/top, tilted,
+// volumetric) are driven by the unified updateHybridVisibility() in
+// animate() instead of the legacy 2-state functions. Set only by
+// runProductionStressTest; cleared in clearStressInstances.
+let productionHybridFade = false;
 
-function createVolumetricInstances(model, positions, hybridFade = false) {
+// Second arg accepts either Vector3[] (legacy) or InstanceSpec[]
+// (T-006-01).
+function createVolumetricInstances(model, arr, hybridFade = false) {
     // Parse the volumetric GLB: quads named vol_layer_{i}_h{mm}
     const layerQuads = [];
 
@@ -3126,6 +4050,14 @@ function createVolumetricInstances(model, positions, hybridFade = false) {
 
     if (hybridFade) volumetricHybridFade = true;
 
+    const isSpec = _isSpecArray(arr);
+    const getPos = i => isSpec ? arr[i].position : arr[i];
+    const getRotY = i => isSpec
+        ? arr[i].rotationY
+        : seededRandom(i + 3333) * Math.PI * 2;
+    const getScale = i => isSpec ? arr[i].scale : 1;
+    const n = arr.length;
+
     const created = [];
     const dummy = new THREE.Object3D();
 
@@ -3143,14 +4075,15 @@ function createVolumetricInstances(model, positions, hybridFade = false) {
         mat.alphaTest = 0.15;
         mat.transparent = true;
         mat.side = THREE.DoubleSide;
-        const instancedMesh = new THREE.InstancedMesh(geom, mat, positions.length);
+        const instancedMesh = new THREE.InstancedMesh(geom, mat, n);
         instancedMesh.frustumCulled = false;
 
-        for (let i = 0; i < positions.length; i++) {
-            const pos = positions[i];
+        for (let i = 0; i < n; i++) {
+            const pos = getPos(i);
             dummy.position.set(pos.x, pos.y, pos.z);
-            dummy.rotation.set(0, seededRandom(i + 3333) * Math.PI * 2, 0);
-            dummy.scale.set(1, 1, 1);
+            dummy.rotation.set(0, getRotY(i), 0);
+            const s = getScale(i);
+            dummy.scale.set(s, s, s);
             dummy.updateMatrix();
             instancedMesh.setMatrixAt(i, dummy.matrix);
         }
@@ -3239,6 +4172,155 @@ function updateBillboardVisibility() {
     }
 }
 
+// T-009-03: Three-state production crossfade (horizontal → tilted →
+// dome). Single visibility pass that reads `lookDownAmount` once and
+// applies four opacities (billboard side, billboard top, tilted,
+// volumetric dome). Replaces the legacy 2-state functions only when
+// `productionHybridFade` is set; standalone preview modes still use
+// `updateBillboardVisibility` / `updateVolumetricVisibility`.
+//
+// Math (see docs/active/work/T-009-03/design.md for the derivation):
+//   sLow  = smoothstep((look - lowStart)  / (lowEnd  - lowStart))
+//   sHigh = smoothstep((look - highStart) / (1 - highStart))
+//   horizontal = 1 - sLow
+//   tilted     = sLow * (1 - sHigh)
+//   dome       = sHigh
+//   side = horizontal * (1 - sLow); top = horizontal * sLow
+function updateHybridVisibility() {
+    const camDir = new THREE.Vector3();
+    camera.getWorldDirection(camDir);
+    const lookDown = Math.abs(camDir.dot(new THREE.Vector3(0, -1, 0)));
+
+    const lowStart  = currentSettings ? currentSettings.tilted_fade_low_start  : 0.30;
+    const lowEnd    = currentSettings ? currentSettings.tilted_fade_low_end    : 0.55;
+    const highStart = currentSettings ? currentSettings.tilted_fade_high_start : 0.75;
+    const highEnd   = 1.0;
+
+    const lowDen  = Math.max(lowEnd  - lowStart,  1e-4);
+    const highDen = Math.max(highEnd - highStart, 1e-4);
+    const lowT  = THREE.MathUtils.clamp((lookDown - lowStart)  / lowDen,  0, 1);
+    const highT = THREE.MathUtils.clamp((lookDown - highStart) / highDen, 0, 1);
+    const sLow  = lowT  * lowT  * (3 - 2 * lowT);
+    const sHigh = highT * highT * (3 - 2 * highT);
+
+    const horizontalOpacity = 1 - sLow;
+    const tiltedOpacity     = sLow * (1 - sHigh);
+    const domeOpacity       = sHigh;
+    const sideOpacity = horizontalOpacity * (1 - sLow);
+    const topOpacity  = horizontalOpacity * sLow;
+
+    applyOpacityToMeshes(billboardInstances,    sideOpacity);
+    applyOpacityToMeshes(billboardTopInstances, topOpacity);
+    applyOpacityToMeshes(tiltedBillboardInstances, tiltedOpacity);
+    applyOpacityToMeshes(volumetricInstances,   domeOpacity);
+}
+
+function applyOpacityToMeshes(arr, opacity) {
+    for (const { mesh } of arr) {
+        mesh.visible = opacity > 0.01;
+        if (mesh.visible) {
+            mesh.material.opacity = opacity;
+            mesh.material.transparent = opacity < 1;
+        }
+    }
+}
+
+// T-009-02: Runtime loader for the tilted-camera billboard bake from
+// T-009-01. Mirrors `createBillboardInstances` but treats every mesh
+// in the model as a side variant — the tilted bake has no
+// `billboard_top` quad. Discriminated by file path (caller passes the
+// gltf scene loaded from `?version=billboard-tilted`), not by quad
+// name, since T-009-01 kept the legacy `billboard_${i}` naming.
+function createTiltedBillboardInstances(model, arr) {
+    const sideQuads = [];
+    model.traverse((child) => { if (child.isMesh) sideQuads.push(child); });
+    if (sideQuads.length === 0) return [];
+
+    const isSpec = _isSpecArray(arr);
+    const specs = isSpec
+        ? arr
+        : arr.map((p, i) => makeInstanceSpec(
+            p,
+            seededRandom(i + 5555) * Math.PI * 2,
+            1,
+        ));
+
+    const numVariants = sideQuads.length;
+    const variantSpecs = Array.from({ length: numVariants }, () => []);
+    for (let i = 0; i < specs.length; i++) {
+        // Distinct seed offset from the horizontal loader's `+9999` so
+        // T-009-03 can run both at the same positions without their
+        // variant assignments collapsing into a visible pattern.
+        const variant = Math.floor(seededRandom(i + 7777) * numVariants);
+        variantSpecs[variant].push(specs[i]);
+    }
+
+    const created = [];
+    const dummy = new THREE.Object3D();
+
+    for (let v = 0; v < numVariants; v++) {
+        const bucket = variantSpecs[v];
+        if (bucket.length === 0) continue;
+
+        const quad = sideQuads[v];
+        const geom = quad.geometry.clone();
+        const mat = quad.material.clone();
+        mat.depthWrite = true;
+        mat.alphaTest = 0.5;
+        mat.transparent = false;
+        const instancedMesh = new THREE.InstancedMesh(geom, mat, bucket.length);
+        instancedMesh.frustumCulled = false;
+
+        for (let i = 0; i < bucket.length; i++) {
+            dummy.position.copy(bucket[i].position);
+            // Yaw is overwritten every frame by
+            // updateTiltedBillboardFacing(); scale is preserved here
+            // so size variation survives the first paint.
+            const s = bucket[i].scale;
+            dummy.scale.set(s, s, s);
+            dummy.updateMatrix();
+            instancedMesh.setMatrixAt(i, dummy.matrix);
+        }
+        instancedMesh.instanceMatrix.needsUpdate = true;
+
+        scene.add(instancedMesh);
+        created.push(instancedMesh);
+        tiltedBillboardInstances.push({
+            mesh: instancedMesh,
+            positions: bucket.map(s => s.position),
+        });
+    }
+
+    // Face the camera on the first frame so the very first paint is
+    // correct (mirrors the trailing updateBillboardFacing() call in
+    // createBillboardInstances).
+    updateTiltedBillboardFacing();
+    return created;
+}
+
+// T-009-02: per-frame yaw update for tilted billboard instances.
+// Identical math to updateBillboardFacing — yaw only, tilt is baked
+// into the texture. Kept as a separate function (not parameterised
+// over the state array) so the two paths can diverge cleanly when
+// T-009-03 layers a crossfade on top.
+function updateTiltedBillboardFacing() {
+    if (tiltedBillboardInstances.length === 0) return;
+    const camPos = camera.position;
+    const dummy = new THREE.Object3D();
+
+    for (const { mesh, positions } of tiltedBillboardInstances) {
+        for (let i = 0; i < positions.length; i++) {
+            const pos = positions[i];
+            dummy.position.copy(pos);
+            dummy.rotation.set(0, Math.atan2(camPos.x - pos.x, camPos.z - pos.z), 0);
+            dummy.scale.set(1, 1, 1);
+            dummy.updateMatrix();
+            mesh.setMatrixAt(i, dummy.matrix);
+        }
+        mesh.instanceMatrix.needsUpdate = true;
+    }
+}
+
 function runStressTest(count, useLods, quality = 0.5) {
     if (!currentModel) return;
     clearStressInstances();
@@ -3247,46 +4329,57 @@ function runStressTest(count, useLods, quality = 0.5) {
 
     // Use original model bbox for consistent spacing regardless of which version is displayed
     const refBBox = originalModelBBox || modelBBox;
-    const size = refBBox ? refBBox.size : new THREE.Box3().setFromObject(currentModel).getSize(new THREE.Vector3());
-    const spacing = Math.max(size.x, size.z) * 1.3;
-    const cols = Math.ceil(Math.sqrt(count));
-    const gridWidth = cols * spacing;
-    const totalRows = Math.ceil(count / cols);
-    const gridDepth = totalRows * spacing;
+    const fallbackSize = new THREE.Box3().setFromObject(currentModel).getSize(new THREE.Vector3());
+    const ctxBBox = refBBox || { size: fallbackSize };
 
-    // Compute all grid positions
-    const positions = [];
-    for (let i = 0; i < count; i++) {
-        const row = Math.floor(i / cols);
-        const col = i % cols;
-        positions.push(new THREE.Vector3(
-            col * spacing - gridWidth / 2 + spacing / 2,
-            0,
-            row * spacing - gridDepth / 2 + spacing / 2
-        ));
-    }
+    // T-006-01: build placements via the active SceneTemplate. The
+    // legacy 100x grid lives on as the `grid` template (T-006-02).
+    const tpl = SCENE_TEMPLATES[activeSceneTemplate] || SCENE_TEMPLATES.grid;
+    const cat = currentSettings && currentSettings.shape_category;
+    const ctx = {
+        bbox: ctxBBox,
+        shapeCategory: cat,
+        orientationRule: (STRATEGY_TABLE[cat] && STRATEGY_TABLE[cat].instance_orientation_rule) || 'random-y',
+        seed: 0,
+    };
+    const specs = tpl.generate(ctx, count);
+    const effectiveCount = specs.length;
+    const positions = specs.map(s => s.position);
+    const bounds = boundsFromSpecs(specs);
+    // Pad bounds by one footprint so the camera doesn't clip the
+    // outermost instances; matches the implicit padding the legacy
+    // grid math got from `spacing/2` centering.
+    const sizeXZ = ctxBBox.size ? Math.max(ctxBBox.size.x, ctxBBox.size.z) : 1;
+    const gridWidth = bounds.sizeX + sizeXZ;
+    const gridDepth = bounds.sizeZ + sizeXZ;
 
     if (!useLods) {
         if (previewVersion === 'billboard') {
             // Billboard mode: always face camera
-            const instances = createBillboardInstances(currentModel, positions);
+            const instances = createBillboardInstances(currentModel, specs);
             stressInstances.push(...instances);
         } else if (previewVersion === 'volumetric') {
             // Volumetric mode: horizontal dome slices (no fade — always visible)
-            const instances = createVolumetricInstances(currentModel, positions, false);
+            const instances = createVolumetricInstances(currentModel, specs, false);
             stressInstances.push(...instances);
         } else if (previewVersion === 'production') {
             // Production hybrid: billboard for low angles + volumetric for top-down,
             // with crossfade at ~45° camera tilt. Loads both GLBs in parallel.
+            // T-006-01: still uses Vector3[] (no per-instance variation
+            // on this path; revisited in T-006-02).
             runProductionStressTest(positions);
         } else {
-            // Regular mode: random Y rotation for variety
-            const instances = createInstancedFromModel(currentModel, count, positions, true);
+            // Regular mode: per-instance rotation+scale come from the
+            // template's InstanceSpec; the legacy randomRotateY flag is
+            // ignored when the helper detects spec input.
+            const instances = createInstancedFromModel(currentModel, effectiveCount, specs, false);
             stressInstances.push(...instances);
         }
     } else {
-        // LOD mode: load LOD models and assign by distance from center
-        runLodStressTest(count, positions, gridWidth, gridDepth, quality);
+        // LOD mode: load LOD models and assign by distance from center.
+        // T-006-01: still uses Vector3[] (LOD path migration is
+        // T-006-02 territory).
+        runLodStressTest(effectiveCount, positions, gridWidth, gridDepth, quality);
     }
 
     // Pull camera back
@@ -3299,9 +4392,9 @@ function runStressTest(count, useLods, quality = 0.5) {
 
     // Stats
     document.getElementById('fpsOverlay').style.display = 'block';
-    document.getElementById('instanceCount').textContent = count.toLocaleString();
-    document.getElementById('totalTris').textContent = (modelTriCount * count).toLocaleString();
-    document.getElementById('estMemory').textContent = formatBytes(lastModelSize * count);
+    document.getElementById('instanceCount').textContent = effectiveCount.toLocaleString();
+    document.getElementById('totalTris').textContent = (modelTriCount * effectiveCount).toLocaleString();
+    document.getElementById('estMemory').textContent = formatBytes(lastModelSize * effectiveCount);
 }
 
 // Production hybrid: load billboard + volumetric models in parallel and create
@@ -3310,12 +4403,16 @@ function runStressTest(count, useLods, quality = 0.5) {
 // on camera angle (~45° threshold).
 async function runProductionStressTest(positions) {
     const file = files.find(f => f.id === selectedFileId);
-    if (!file || !file.has_billboard || !file.has_volumetric) return;
+    // T-009-03: production hybrid now requires all three impostor layers.
+    if (!file || !file.has_billboard || !file.has_billboard_tilted || !file.has_volumetric) return;
 
     try {
-        const [billboardGltf, volumetricGltf] = await Promise.all([
+        const [billboardGltf, tiltedGltf, volumetricGltf] = await Promise.all([
             new Promise((resolve, reject) => loader.load(
                 `/api/preview/${selectedFileId}?version=billboard&t=${Date.now()}`,
+                resolve, undefined, reject)),
+            new Promise((resolve, reject) => loader.load(
+                `/api/preview/${selectedFileId}?version=billboard-tilted&t=${Date.now()}`,
                 resolve, undefined, reject)),
             new Promise((resolve, reject) => loader.load(
                 `/api/preview/${selectedFileId}?version=volumetric&t=${Date.now()}`,
@@ -3323,15 +4420,27 @@ async function runProductionStressTest(positions) {
         ]);
 
         applyEnvironmentToModel(billboardGltf.scene);
+        applyEnvironmentToModel(tiltedGltf.scene);
         applyEnvironmentToModel(volumetricGltf.scene);
 
-        // Billboard instances (camera-facing, fade out when looking down)
+        // Horizontal billboard instances (side + top quads, fade out as
+        // the camera tilts past the low band).
         const bbInstances = createBillboardInstances(billboardGltf.scene, positions);
         stressInstances.push(...bbInstances);
 
-        // Volumetric instances (horizontal dome slices, fade in when looking down)
+        // Tilted billboard instances (elevated-camera impostor, peak
+        // visibility in the ~45° band between the low and high fades).
+        const tiltedInstances = createTiltedBillboardInstances(tiltedGltf.scene, positions);
+        stressInstances.push(...tiltedInstances);
+
+        // Volumetric instances (horizontal dome slices, fade in across
+        // the high band as the camera approaches straight down).
         const volInstances = createVolumetricInstances(volumetricGltf.scene, positions, true);
         stressInstances.push(...volInstances);
+
+        // T-009-03: hand control of all four arrays to the unified
+        // updateHybridVisibility() in animate().
+        productionHybridFade = true;
     } catch (err) {
         console.error('Production stress test failed:', err);
     }
@@ -3339,8 +4448,9 @@ async function runProductionStressTest(positions) {
 
 async function runLodStressTest(count, positions, gridWidth, gridDepth, quality = 0.5) {
     const file = files.find(f => f.id === selectedFileId);
+    const randomRotate = shouldRandomRotateInstances();
     if (!file || !file.lods || file.lods.length === 0) {
-        const instances = createInstancedFromModel(currentModel, count, positions, true);
+        const instances = createInstancedFromModel(currentModel, count, positions, randomRotate);
         stressInstances.push(...instances);
         return;
     }
@@ -3426,8 +4536,9 @@ async function runLodStressTest(count, positions, gridWidth, gridDepth, quality 
                 // Volumetric: layered billboard impostor (camera-facing + depth layers)
                 instances = createVolumetricInstances(model, bucket);
             } else {
-                // Mesh LOD: random Y rotation for visual variety
-                instances = createInstancedFromModel(model, bucket.length, bucket, true);
+                // Mesh LOD: random Y rotation for visual variety,
+                // unless the strategy router pinned orientation (T-004-05).
+                instances = createInstancedFromModel(model, bucket.length, bucket, randomRotate);
             }
             stressInstances.push(...instances);
 
@@ -3448,6 +4559,43 @@ async function runLodStressTest(count, positions, gridWidth, gridDepth, quality 
 
     document.getElementById('totalTris').textContent = totalTris.toLocaleString();
     document.getElementById('estMemory').textContent = formatBytes(totalMem);
+}
+
+// ── First-run hint + inline help (T-008-03) ──
+//
+// paintHelpText runs once at startup. It walks every
+// [data-help-id] inside the right-panel tuning section and appends
+// a `<div class="tooltip">` (the existing inline-italic style used
+// elsewhere in the form) carrying the matching string from
+// help_text.js. Skips rows already painted so calling it twice is
+// a no-op.
+function paintHelpText() {
+    const rows = document.querySelectorAll('[data-help-id]');
+    for (const row of rows) {
+        if (row.querySelector(':scope > .tooltip[data-help-paint]')) continue;
+        const key = row.getAttribute('data-help-id');
+        const text = HELP_TEXT[key];
+        if (!text) continue;
+        const tip = document.createElement('div');
+        tip.className = 'tooltip';
+        tip.setAttribute('data-help-paint', '1');
+        tip.textContent = text;
+        row.appendChild(tip);
+    }
+}
+
+// updatePlaceholderState picks between the first-run "Get started"
+// hint and the plain "select or drop a file" fallback. Called from
+// renderFileList() (so add/delete update it) and once at startup
+// after refreshFiles() resolves.
+function updatePlaceholderState() {
+    const hintEl = document.getElementById('firstRunHint');
+    const fallbackEl = document.getElementById('placeholderFallback');
+    if (!hintEl || !fallbackEl) return;
+    if (files.length > 0) firstRunHintDismissed = true;
+    const showHint = !firstRunHintDismissed && files.length === 0;
+    hintEl.style.display = showHint ? 'block' : 'none';
+    fallbackEl.style.display = showHint ? 'none' : 'block';
 }
 
 // ── Preview Controls ──
@@ -3498,10 +4646,15 @@ function selectFile(id) {
             }
             await startAnalyticsSession(id);
             populateTuningUI();
+            populateScenePreviewUI();
             populateAcceptedUI(id);
             // T-007-02: apply the asset's saved preset to the live
             // scene and reset the stale-bake flag for the new asset.
+            // applyTuningToLiveScene then layers the per-slider
+            // intensities on top so the live preview reflects the
+            // asset's saved tuning the moment it loads.
             applyPresetToLiveScene();
+            applyTuningToLiveScene();
             setBakeStale(false);
             const loadPromise = loadModel(`/api/preview/${id}?version=original&t=${Date.now()}`, file.original_size);
             // T-004-04: low-confidence assets auto-open the comparison
@@ -3571,6 +4724,7 @@ function applyColorCalibration(id) {
         // T-007-02: when calibration is torn down, fall back to the
         // active preset rather than raw neutral white.
         applyPresetToLiveScene();
+        applyTuningToLiveScene();
         if (currentModel) {
             const url = `/api/preview/${id}?version=${previewVersion}&t=${Date.now()}`;
             loadModel(url, lastModelSize);
@@ -3604,13 +4758,15 @@ function updatePreviewButtons() {
     // LOD buttons
     const hasLods = file && file.lods && file.lods.length > 0;
     const hasVlods = file && file.volumetric_lods && file.volumetric_lods.length > 0;
-    lodToggle.style.display = hasLods || hasVlods || (file && (file.has_billboard || file.has_volumetric)) ? 'flex' : 'none';
+    lodToggle.style.display = hasLods || hasVlods || (file && (file.has_billboard || file.has_billboard_tilted || file.has_volumetric)) ? 'flex' : 'none';
 
     lodToggle.querySelectorAll('button').forEach(btn => {
         const lod = btn.dataset.lod;
         btn.classList.toggle('active', previewVersion === lod);
         if (lod === 'billboard') {
             btn.disabled = !(file && file.has_billboard);
+        } else if (lod === 'billboard-tilted') {
+            btn.disabled = !(file && file.has_billboard_tilted);
         } else if (lod === 'volumetric') {
             btn.disabled = !(file && file.has_volumetric);
         } else if (lod === 'production') {
@@ -3631,15 +4787,13 @@ function updatePreviewButtons() {
     generateVolumetricBtn.disabled = !file || !currentModel;
     generateVolumetricLodsBtn.disabled = !file || !currentModel;
     generateProductionBtn.disabled = !file || !currentModel;
-    uploadReferenceBtn.disabled = !file;
+    // T-010-03: pack build needs the side intermediate plus at least
+    // one of the optional layers (tilted or dome). Mirrors the
+    // ticket's acceptance criterion verbatim.
+    buildPackBtn.disabled = !(file && file.has_billboard
+                              && (file.has_billboard_tilted || file.has_volumetric));
+    prepareForSceneBtn.disabled = !file || !currentModel;
     testLightingBtn.disabled = !file || !currentModel;
-    if (file && file.has_reference) {
-        uploadReferenceBtn.textContent = 'Reference ✓';
-        uploadReferenceBtn.title = 'Reference image loaded — click to replace';
-    } else {
-        uploadReferenceBtn.textContent = 'Reference Image';
-        uploadReferenceBtn.title = 'Upload a reference image to calibrate scene lighting';
-    }
 }
 
 function setWireframe(enabled) {
@@ -3669,7 +4823,6 @@ dropZone.addEventListener('drop', (e) => {
     if (droppedFiles.length > 0) uploadFiles(droppedFiles);
 });
 
-processAllBtn.addEventListener('click', processAll);
 downloadAllBtn.addEventListener('click', () => { window.location.href = '/api/download-all'; });
 
 // Preview version toggle
@@ -3700,7 +4853,7 @@ lodToggle.querySelectorAll('button').forEach(btn => {
         updatePreviewButtons();
 
         let fileSize = 0;
-        if (version === 'billboard' || version === 'volumetric' || version === 'production') {
+        if (version === 'billboard' || version === 'billboard-tilted' || version === 'volumetric' || version === 'production') {
             fileSize = 50000; // estimate
         } else if (version.startsWith('vlod')) {
             const idx = parseInt(version[4]);
@@ -3709,10 +4862,18 @@ lodToggle.querySelectorAll('button').forEach(btn => {
             const idx = parseInt(version[3]);
             fileSize = file.lods?.[idx]?.size || 0;
         }
-        // Production preview shows the volumetric model (the static slices) since
-        // the hybrid behavior only kicks in during stress test instancing
-        const previewVer = version === 'production' ? 'volumetric' : version;
-        loadModel(`/api/preview/${selectedFileId}?version=${previewVer}&t=${Date.now()}`, fileSize);
+        // Production preview: trigger a 1-instance stress test through the
+        // hybrid path so the user sees the full three-phase crossfade
+        // (side billboards → tilted billboards → volumetric dome) on a
+        // single instance, with the original mesh hidden. Without this,
+        // clicking "Production" used to load the static volumetric mesh
+        // and leave the base model visible — see runStressTest at the
+        // top of this file for the path it takes.
+        if (version === 'production') {
+            runStressTest(1, false);
+            return;
+        }
+        loadModel(`/api/preview/${selectedFileId}?version=${version}&t=${Date.now()}`, fileSize);
     });
 });
 
@@ -3747,10 +4908,26 @@ generateProductionBtn.addEventListener('click', () => {
     if (selectedFileId) generateProductionAsset(selectedFileId);
 });
 
-uploadReferenceBtn.addEventListener('click', () => {
-    if (selectedFileId) referenceFileInput.click();
+buildPackBtn.addEventListener('click', () => {
+    if (selectedFileId) buildAssetPack(selectedFileId);
 });
 
+// T-008-01: Prepare-for-scene primary action + post-run "View in scene"
+// affordance. The view-in-scene button just delegates to the existing
+// stress-test "Run scene" button so it picks up the asset's current
+// scene template, instance count, and ground/LOD toggles unchanged.
+prepareForSceneBtn.addEventListener('click', () => {
+    if (selectedFileId) prepareForScene(selectedFileId);
+});
+
+viewInSceneBtn.addEventListener('click', () => {
+    const stressBtnEl = document.getElementById('stressBtn');
+    if (stressBtnEl) stressBtnEl.click();
+});
+
+// T-008-02: toolbar #uploadReferenceBtn removed. The hidden
+// #referenceFileInput is now triggered only by the in-tuning-panel
+// button (see wireTuningUI → #tuneReferenceImageBtn).
 referenceFileInput.addEventListener('change', () => {
     if (referenceFileInput.files.length > 0 && selectedFileId) {
         uploadReferenceImage(selectedFileId, referenceFileInput.files[0]);
@@ -3778,16 +4955,13 @@ document.querySelectorAll('.preset-btn').forEach(btn => {
     btn.addEventListener('click', () => applyPreset(btn.dataset.preset));
 });
 
-// Stress test
-const stressSlider = document.getElementById('stressCount');
-const stressValueEl = document.getElementById('stressCountValue');
+// Scene preview controls (T-006-02)
 const stressBtn = document.getElementById('stressBtn');
 const stressUseLods = document.getElementById('stressUseLods');
 const lodQualitySlider = document.getElementById('lodQuality');
 const lodQualityValue = document.getElementById('lodQualityValue');
 const lodQualityLabel = document.getElementById('lodQualityLabel');
 
-stressSlider.addEventListener('input', () => { stressValueEl.textContent = stressSlider.value + 'x'; });
 lodQualitySlider.addEventListener('input', () => { lodQualityValue.textContent = lodQualitySlider.value + '%'; });
 
 // Show/hide quality slider when LOD checkbox changes
@@ -3798,13 +4972,53 @@ stressUseLods.addEventListener('change', () => {
     lodQualityLabel.style.display = show ? '' : 'none';
 });
 
+// Picker change: update active template, persist, emit analytics.
+sceneTemplateSelect.addEventListener('change', () => {
+    const from = getActiveSceneTemplate();
+    const to = sceneTemplateSelect.value;
+    if (from === to) return;
+    setSceneTemplate(to);
+    if (currentSettings) {
+        currentSettings.scene_template_id = to;
+        if (selectedFileId) saveSettings(selectedFileId);
+    }
+    logEvent('scene_template_selected', {
+        from,
+        to,
+        instance_count: parseInt(sceneInstanceCount.value, 10) || 0,
+        ground_plane: sceneGroundToggle.checked,
+    }, selectedFileId);
+});
+
+// Count input change: clamp, persist. No analytics emission — count
+// rides along inside scene_template_selected, and the resting value
+// is captured in session_end's final_settings.
+sceneInstanceCount.addEventListener('change', () => {
+    const n = Math.max(1, Math.min(500, parseInt(sceneInstanceCount.value, 10) || 1));
+    sceneInstanceCount.value = n;
+    if (currentSettings) {
+        currentSettings.scene_instance_count = n;
+        if (selectedFileId) saveSettings(selectedFileId);
+    }
+});
+
+// Ground plane toggle: flip mesh visibility, persist.
+sceneGroundToggle.addEventListener('change', () => {
+    const on = sceneGroundToggle.checked;
+    if (groundPlane) groundPlane.visible = on;
+    if (currentSettings) {
+        currentSettings.scene_ground_plane = on;
+        if (selectedFileId) saveSettings(selectedFileId);
+    }
+});
+
 stressBtn.addEventListener('click', () => {
-    const count = parseInt(stressSlider.value);
+    const count = parseInt(sceneInstanceCount.value, 10) || 1;
     if (count <= 1) {
         clearStressInstances();
         if (currentModel) { currentModel.position.set(0, 0, 0); frameCamera(currentModel); }
     } else {
-        const quality = parseInt(lodQualitySlider.value) / 100;
+        const quality = parseInt(lodQualitySlider.value, 10) / 100;
         runStressTest(count, stressUseLods.checked, quality);
     }
 });
@@ -3812,7 +5026,14 @@ stressBtn.addEventListener('click', () => {
 // ── Init ──
 console.log('GLB Optimizer frontend loaded');
 initThreeJS();
+// T-008-03: paint inline help text into tuning rows + render the
+// first-run hint state. paintHelpText is idempotent and pure DOM;
+// updatePlaceholderState runs again from renderFileList() once
+// refreshFiles() resolves with the actual file list.
+paintHelpText();
+updatePlaceholderState();
 refreshFiles();
+populateScenePreviewSelect();
 applyDefaults();
 populateLightingPresetSelect();
 wireTuningUI();

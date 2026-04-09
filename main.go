@@ -16,6 +16,29 @@ import (
 var staticFiles embed.FS
 
 func main() {
+	// T-010-04: subcommand dispatch. `glb-optimizer pack <id>` and
+	// `glb-optimizer pack-all` short-circuit before the server's
+	// gltfpack/blender checks so the demo recipe can run on a
+	// laptop without those binaries on PATH.
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "pack":
+			os.Exit(runPackCmd(os.Args[2:]))
+		case "pack-all":
+			os.Exit(runPackAllCmd(os.Args[2:]))
+		case "pack-inspect":
+			os.Exit(runPackInspectCmd(os.Args[2:]))
+		case "clean-stale-packs":
+			os.Exit(runCleanStalePacksCmd(os.Args[2:]))
+		case "bake-status":
+			os.Exit(runBakeStatusCmd(os.Args[2:]))
+		case "prepare":
+			os.Exit(runPrepareCmd(os.Args[2:]))
+		case "prepare-all":
+			os.Exit(runPrepareAllCmd(os.Args[2:]))
+		}
+	}
+
 	port := flag.Int("port", 8787, "HTTP server port")
 	dir := flag.String("dir", "", "Working directory (default: ~/.glb-optimizer)")
 	flag.Parse()
@@ -60,8 +83,16 @@ func main() {
 	profilesDir := filepath.Join(workDir, "profiles")
 	acceptedDir := filepath.Join(workDir, "accepted")
 	acceptedThumbsDir := filepath.Join(acceptedDir, "thumbs")
+	// T-010-03: finished asset packs land here, ready to be USB-copied
+	// to the demo laptop. Sibling of outputs/, not nested inside it.
+	distPlantsDir := filepath.Join(workDir, DistPlantsDir)
 
-	for _, d := range []string{originalsDir, outputsDir, settingsDir, tuningDir, profilesDir, acceptedDir, acceptedThumbsDir} {
+	// T-012-04: persistent index from upload hash → original filename.
+	// Lives at the workDir root because it is a single file (not a
+	// directory of artifacts) and should follow the workDir's lifetime.
+	uploadsManifestPath := filepath.Join(workDir, "uploads.jsonl")
+
+	for _, d := range []string{originalsDir, outputsDir, settingsDir, tuningDir, profilesDir, acceptedDir, acceptedThumbsDir, distPlantsDir} {
 		if err := os.MkdirAll(d, 0755); err != nil {
 			fmt.Fprintf(os.Stderr, "Error: cannot create directory %s: %v\n", d, err)
 			os.Exit(1)
@@ -88,6 +119,17 @@ func main() {
 		}
 	}
 
+	// Resolve render_production.py script path for the build-production endpoint.
+	renderScriptPath := filepath.Join("scripts", "render_production.py")
+	if _, err := os.Stat(renderScriptPath); err != nil {
+		if exePath, err2 := os.Executable(); err2 == nil {
+			alt := filepath.Join(filepath.Dir(exePath), "scripts", "render_production.py")
+			if _, err3 := os.Stat(alt); err3 == nil {
+				renderScriptPath = alt
+			}
+		}
+	}
+
 	// Initialize file store and scan existing files
 	store := NewFileStore()
 	scanExistingFiles(store, originalsDir, outputsDir, settingsDir, acceptedDir)
@@ -102,7 +144,7 @@ func main() {
 	// Routes
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("/api/upload", handleUpload(store, originalsDir))
+	mux.HandleFunc("/api/upload", handleUpload(store, originalsDir, settingsDir, uploadsManifestPath, analyticsLogger))
 	mux.HandleFunc("/api/files", func(w http.ResponseWriter, r *http.Request) {
 		// Route DELETE /api/files/:id vs GET /api/files
 		if r.Method == http.MethodDelete || strings.Count(r.URL.Path, "/") > 2 {
@@ -119,13 +161,17 @@ func main() {
 	mux.HandleFunc("/api/generate-lods/", handleGenerateLODs(store, originalsDir, outputsDir))
 	mux.HandleFunc("/api/generate-blender-lods/", handleGenerateBlenderLODs(store, originalsDir, outputsDir, blenderInfo, blenderScriptPath))
 	mux.HandleFunc("/api/upload-billboard/", handleUploadBillboard(store, outputsDir))
+	mux.HandleFunc("/api/upload-billboard-tilted/", handleUploadBillboardTilted(store, outputsDir))
 	mux.HandleFunc("/api/upload-volumetric/", handleUploadVolumetric(store, outputsDir))
 	mux.HandleFunc("/api/upload-volumetric-lod/", handleUploadVolumetricLOD(store, outputsDir))
+	mux.HandleFunc("/api/bake-complete/", handleBakeComplete(store, outputsDir))
+	mux.HandleFunc("/api/pack/", handleBuildPack(store, originalsDir, settingsDir, outputsDir, distPlantsDir))
 	mux.HandleFunc("/api/upload-reference/", handleUploadReference(store, outputsDir))
 	mux.HandleFunc("/api/reference/", handleReferenceImage(store, outputsDir))
 	mux.HandleFunc("/api/optimize-scene", handleOptimizeScene(store, originalsDir, outputsDir))
 	mux.HandleFunc("/api/status", handleStatus(blenderInfo))
 	mux.HandleFunc("/api/settings/", handleSettings(store, settingsDir))
+	mux.HandleFunc("/api/classify/", handleClassify(store, originalsDir, settingsDir, analyticsLogger))
 	mux.HandleFunc("/api/preview/", handlePreview(store, originalsDir, outputsDir))
 	mux.HandleFunc("/api/analytics/event", handleAnalyticsEvent(analyticsLogger))
 	mux.HandleFunc("/api/analytics/start-session", handleAnalyticsStartSession(analyticsLogger))
@@ -141,15 +187,19 @@ func main() {
 	})
 	mux.HandleFunc("/api/profiles/", handleProfile(profilesDir))
 	mux.HandleFunc("/api/accept/", handleAccept(store, settingsDir, acceptedDir, acceptedThumbsDir, analyticsLogger))
+	mux.HandleFunc("/api/build-production/", handleBuildProduction(store, settingsDir, outputsDir, blenderInfo, renderScriptPath))
 
 	// Serve embedded static files
 	staticFS, _ := fs.Sub(staticFiles, "static")
 	fileServer := http.FileServer(http.FS(staticFS))
 	mux.Handle("/", fileServer)
 
-	addr := fmt.Sprintf("localhost:%d", *port)
-	url := fmt.Sprintf("http://%s", addr)
-	fmt.Printf("GLB Optimizer running at %s\n", url)
+	// Bind 0.0.0.0 so the server is reachable from other hosts on the
+	// LAN / tailnet (demo day: dev laptop accesses this Mac mini via
+	// tailscale). Local browsers can still hit http://localhost:PORT.
+	addr := fmt.Sprintf("0.0.0.0:%d", *port)
+	url := fmt.Sprintf("http://localhost:%d", *port)
+	fmt.Printf("GLB Optimizer running at %s (also reachable on the LAN/tailnet)\n", url)
 
 	// Open browser (macOS)
 	go exec.Command("open", url).Run()
@@ -203,6 +253,13 @@ func scanExistingFiles(store *FileStore, originalsDir, outputsDir, settingsDir, 
 			}
 		}
 		record.IsAccepted = AcceptedExists(id, acceptedDir)
+		// T-009-01: surface tilted-billboard presence on restart so the
+		// runtime (T-009-02) can pick it up without re-baking. The
+		// existing billboard / volumetric flags are still upload-only —
+		// retrofitting them is out of scope for this ticket.
+		if _, err := os.Stat(filepath.Join(outputsDir, id+"_billboard_tilted.glb")); err == nil {
+			record.HasBillboardTilted = true
+		}
 
 		store.Add(record)
 	}
