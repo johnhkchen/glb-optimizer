@@ -104,7 +104,7 @@ Emitted whenever the user triggers a bake / optimize action.
 
 | Field            | Type    | Required | Notes                                                                     |
 |------------------|---------|----------|---------------------------------------------------------------------------|
-| `trigger`        | string  | yes      | Which generate action fired this. T-003-02 emits `billboard`, `volumetric`, `volumetric_lods`, `production`. |
+| `trigger`        | string  | yes      | Which generate action fired this. T-003-02 emits `billboard`, `volumetric`, `volumetric_lods`, `production`. T-009-01 adds `billboard_tilted` (devtools-only entry point — no toolbar button in v1). |
 | `success`        | boolean | yes      | `true` if the generate function ran to completion (upload accepted, store updated); `false` if any step threw. |
 | `output_glb`     | string  | no       | Reserved. Path to the produced GLB, relative to the workdir.              |
 | `thumbnail_path` | string  | no       | Reserved for the S-003 thumbnail-linking work (T-003-04).                 |
@@ -221,6 +221,56 @@ have agreed?" analysis.
 | `candidates`          | array  | yes      | The candidate ranking the user picked from. Same shape as `classification.features.candidates`: `[{category, score}, ...]`, sorted descending. May be `null` if the classifier feature dump did not include a ranking (e.g. legacy classifier output). |
 | `chosen_category`     | string | yes      | One of the `shape_category` enum values. Persisted to `AssetSettings.shape_category` and stamped through the strategy router. |
 | `features`            | object | yes      | Same opaque feature dump as in `classification` events.                              |
+
+### `scene_template_selected`
+
+Emitted by the JS side when the user changes the active scene
+preview template via the toolbar picker (T-006-02). Only fired on
+actual change (`from !== to`); the count input and ground plane
+toggle do NOT emit their own events — they snapshot into the
+payload here, and the next `session_end` carries the resting
+values via `final_settings`.
+
+```json
+{
+  "from": "grid",
+  "to": "mixed-bed",
+  "instance_count": 50,
+  "ground_plane": true
+}
+```
+
+| Field            | Type   | Required | Notes                                                                            |
+|------------------|--------|----------|----------------------------------------------------------------------------------|
+| `from`           | string | yes      | The previous template id. One of the keys in `validSceneTemplates` (settings.go). |
+| `to`             | string | yes      | The new template id. Different from `from`.                                      |
+| `instance_count` | number | yes      | Snapshot of the count input at change time, integer in `[1, 500]`.               |
+| `ground_plane`   | bool   | yes      | Snapshot of the ground plane toggle at change time.                              |
+
+### `prepare_for_scene`
+
+Emitted by the JS side when the user clicks the **Prepare for scene**
+primary action (T-008-01) and the orchestrator finishes — either after
+all stages succeed, or after the first stage failure stops the pipeline.
+Exactly one event per click. Per-stage `regenerate` events continue to
+fire from inside the underlying generate functions; this event is the
+higher-level summary on top.
+
+```json
+{
+  "stages_run": ["gltfpack", "classify", "lods", "production"],
+  "total_duration_ms": 18432,
+  "success": true
+}
+```
+
+| Field               | Type             | Required | Notes                                                                                              |
+|---------------------|------------------|----------|----------------------------------------------------------------------------------------------------|
+| `stages_run`        | array of string  | yes      | Stage ids that actually ran, in order. Skipped stages (e.g. `gltfpack` when the file is already optimized, `classify` when `shape_confidence > 0`) are omitted. v1 stage ids: `gltfpack`, `classify`, `lods`, `production`. |
+| `total_duration_ms` | integer          | yes      | Wall-clock duration of the orchestrator run, including skipped-stage no-ops.                       |
+| `success`           | boolean          | yes      | `true` if every executed stage reported success; `false` if any stage failed and the pipeline stopped. |
+| `failed_stage`      | string           | no       | Present only when `success === false`. The stage id that failed.                                   |
+| `error`             | string           | no       | Present only when `success === false`. Short human-readable error message.                         |
 
 ### `strategy_selected`
 
