@@ -1,133 +1,181 @@
-# Project Status — glb-optimizer + plantastic integration
+# Project Status — glb-optimizer
 
-*Last updated: 2026-04-09*
+*Last updated: 2026-04-10*
 
-## Overview
+## What this is
 
-Two repos form a plant-asset pipeline for a landscaping demo:
+Go server + Blender Python scripts that take raw 3D plant models (TRELLIS
+GLBs) and produce lightweight "Pack v1" impostor assets with billboard
+textures for real-time rendering.
 
-**glb-optimizer** (`/Volumes/ext1/swe/repos/glb-optimizer`) — Go server + Blender Python scripts that take raw 3D plant models (TRELLIS GLBs) and produce mobile-friendly "Pack v1" impostor assets. The pipeline is: source GLB → gltfpack mesh optimization → PCA shape classification → LOD generation → Blender headless billboard/tilted/volumetric rendering → pack combine + verify.
+Part of a four-repo system. See also:
+- [plant-catalog PROJECT_STATUS](https://github.com/johnhkchen/plant-catalog/blob/main/docs/PROJECT_STATUS.md) — catalog, storefront, design tools
+- [plant-catalog PRODUCT.md](https://github.com/johnhkchen/plant-catalog/blob/main/docs/PRODUCT.md) — full product vision
+- [plant-catalog NORTH_STAR.md](https://github.com/johnhkchen/plant-catalog/blob/main/docs/NORTH_STAR.md) — Laura & Marco scenario
 
-**plantastic** (`/Users/johnchen/swe/repos/plantastic`) — Rust + SvelteKit landscaping platform. The `web/` directory contains a Three.js scene viewer showing a LIDAR-scanned Powell & Market demo scene with raised beds populated by plant impostors. The rendering uses a four-variant hybrid impostor scheme (side billboards → tilted billboards → volumetric dome slices, crossfaded by camera elevation angle).
+| Repo | Role | Status |
+|------|------|--------|
+| **plant-model-studio** | Upstream: research → image gen → TRELLIS 2 | Complete (23/23) |
+| **glb-optimizer** (this) | Midstream: GLB → bake → Pack v1 | Complete (24/24) + S-015 open |
+| **plant-catalog** | Downstream: catalog + storefront + design tools + API | 89/89 + S-033 open |
+| **plantastic** | Consumer: SvelteKit + Three.js scene viewer | Complete (60/60) |
 
 ## Current state
 
-### glb-optimizer — fully done (24/24 tickets)
+**24/24 original tickets complete.** Full pipeline operational. One new
+story (S-015) filed for a rendering bug.
 
-| Epic/Story | Status | What it delivered |
-|---|---|---|
-| E-002 S-010 | done | Pack v1 format spec, GLB combine step |
-| E-002 S-011 | done | Pack distribution, bake-time metadata capture, integration handshake gate |
-| E-002 S-012 | done | Hash-to-species resolver, pack-inspect CLI, standalone verifier, filename persistence, stale cleanup |
-| E-002 S-013 | done (superseded) | Playwright headless bake — replaced by S-014 |
-| E-002 S-014 | done | Server-side Blender rendering, `POST /api/build-production/{id}`, `prepare` CLI, UI button wiring |
+### What works
 
-**CLI entry point**: `glb-optimizer prepare <source.glb> -category round-bush -resolution 256`
+- **CLI**: `glb-optimizer prepare <source.glb> -category round-bush -resolution 256`
+- **Pipeline**: source GLB → gltfpack optimize → PCA classify → LOD generate → Blender headless render (side/tilted/volumetric billboards) → pack combine + verify
+- **Pack v1 format**: single GLB with `view_side` (N yaw variants), `view_tilted` (N tilted variants), `view_dome` (M height slices), plus metadata at `scene.extras.plantastic`
+- **Blender 5.x compat**: engine name probing, use_bloom guard, temp-PNG pixel readback, calc_normals guard
+- **Server**: web UI for upload, classify, bake, tune, accept + preview
+- **Additional CLIs**: pack, pack-all, pack-inspect, clean-stale-packs, bake-status, prepare-all
+- **Tests**: 33 test files, all passing (3.3s)
 
-Three species baked and verified in `~/.glb-optimizer/dist/plants/`:
-- `achillea_millefolium.glb` (2.5 MB, 10s bake)
-- `coffeeberry.glb` (2.8 MB, 11s bake)
-- `dahlia_blush.glb` (2.9 MB, 15s bake)
+### Species baked
 
-Source GLBs live in `inbox/` at the repo root.
+Three species in `~/.glb-optimizer/dist/plants/`:
 
-### plantastic — 55/60 tickets done
+| Species | Pack size | Source size |
+|---------|-----------|-------------|
+| achillea_millefolium | 2.5 MB | 14 MB |
+| coffeeberry | 2.9 MB | 12 MB |
+| dahlia_blush | 3.0 MB | 30 MB |
 
-| Epic/Story | Status | What it delivered |
-|---|---|---|
-| E-028 S-080 | done | Pack loader, registry interface, prebuild script, terrain manifest |
-| E-028 S-081 | done | SpeciesInstancer (4-variant hybrid), PlantingSystem, scale jitter, engine wiring |
-| E-028 S-082 | done | Mixed-species beds, stripe-band assignment, per-species sizing, tier escalation |
-| E-028 S-083 | done | Replace clone loop, asset cleanup, USB procedure, smoke test, integration gate, plant list overlay |
-| E-028 S-084 | done | TS triage, real-pack test fixture, mock builder, headless engine, demo:check CLI, schema drift detector |
-| E-028 S-085 | done | Code hygiene — all tests pass, TS clean, prettier, packs deployed |
-| E-028 S-086 | done | Offline laptop demo — static bundle, slim clone, raw scan bloat removed, transfer verification |
-| **E-029 S-087** | **in progress** | Deploy real packs + verify rendering — T-087-01 done, T-087-02 in implement |
-| E-029 S-088 | blocked | Demo bundle refresh — waiting on S-087 |
+Both packs AND source models are uploaded to plant-catalog's R2 bucket:
+- `packs/{species}.glb` — Pack v1 billboard quads
+- `sources/{species}.glb` — TRELLIS 3D source mesh
 
-## What's happening right now
+### Open issue: S-015 — Top-down render incorrect for round-bush
 
-T-087-02 is in `implement` — an agent is verifying whether the SpeciesInstancer correctly renders the real Pack v1 files in the demo scene. This is the first time real billboard textures flow through the full pipeline into the scene.
+**T-015-01**: The dome/volumetric slice camera in `render_production.py` is
+positioned incorrectly for the round-bush strategy. Instead of capturing
+overhead canopy views, it produces side-profile views that look flat when
+viewed top-down. The side and tilted billboards render correctly.
 
-**Likely issues the agent will hit**:
-- Plant sizing: real bbox values (canopy radius ~0.38m) differ from the white-quad fallback (0.18m). Plants may be correctly spaced but look sparser.
-- Plant scale: real `bbox.height` (~1.0m from the model) vs the fallback's tuned `TARGET_HEIGHT_M / naturalHeight` ratio. May need adjustment.
-- Crossfade band tuning: the `low_start/low_end/high_start` values were calibrated against client-side JS output; Blender renders might look different at transition angles.
-- Material properties: Blender-exported PBR materials may interact differently with the instancer's opacity driving.
+Investigation needed in `scripts/render_production.py` — the dome slice
+camera rig likely reuses the side billboard orbital camera instead of
+positioning directly overhead.
 
-## Immediate priorities
+## Pipeline architecture
 
-1. **Land T-087-02** (verify rendering) and **T-087-03** (fix any visual issues)
-2. **T-087-04** — make the fallback loud (`console.error` instead of `warn`) so it's obvious if it fires
-3. **T-088-01 + T-088-02** — rebuild the offline demo bundle with real packs, test on laptop
+```
+Source GLB (TRELLIS output, 12-30 MB)
+    │
+    ▼
+gltfpack mesh optimization → outputs/{id}.glb
+    │
+    ▼
+PCA shape classification → settings/{id}.json (category, strategy)
+    │
+    ▼
+LOD generation → outputs/{id}_lod0.glb ... _lod3.glb
+    │
+    ▼
+Blender headless render (render_production.py)
+├── Side billboards (N angles)    → outputs/{id}_billboard.glb
+├── Tilted billboards (N angles)  → outputs/{id}_billboard_tilted.glb
+└── Volumetric dome slices (M)    → outputs/{id}_volumetric.glb
+    │
+    ▼
+Pack combine + verify → dist/plants/{species}.glb (Pack v1)
+    │
+    ▼
+Upload to R2 → plant-catalog serves via /api/packs/?preview
+```
+
+## Pack v1 scene graph
+
+```
+pack_root
+├── view_side (7 children)      ← yaw-variant billboard quads
+│   ├── variant_0 [4 verts, own texture]
+│   ├── variant_1
+│   └── ...
+├── view_tilted (6 children)    ← 30° elevation billboard quads
+│   ├── variant_0
+│   └── ...
+└── view_dome (4 children)      ← horizontal dome cross-sections
+    ├── slice_0 [144 verts]
+    ├── slice_1
+    └── ...
+```
+
+Coordinate convention: billboard quads lie in the XZ plane (Blender Y-up
+exported as glTF Y-up). Side/tilted quads have Y=0 with X/Z extent.
+Dome slices are in XY plane with Z=0.
+
+Pack metadata at `scene.extras.plantastic`:
+```json
+{
+  "format_version": 1,
+  "bake_id": "2026-04-09T18:30:00Z",
+  "species": "achillea_millefolium",
+  "footprint": { "canopy_radius_m": 0.3, "height_m": 0.6 },
+  "fade": { "low_start": 0.30, "low_end": 0.55, "high_start": 0.75 }
+}
+```
+
+## Key files
+
+| File | Purpose |
+|------|---------|
+| `main.go` | Server + CLI subcommand dispatch |
+| `prepare_cmd.go` | End-to-end prepare pipeline |
+| `combine.go` | Pack v1 GLB assembly |
+| `pack_writer.go` | Pack binary writing |
+| `classify.go` | PCA shape classification |
+| `scripts/render_production.py` | Blender headless impostor renderer |
+| `strategy.go` | Per-category render strategy table |
+| `settings.go` | Per-asset settings (category, fade bands) |
+| `justfile` | Task runner recipes |
 
 ## Key commands
 
 ```sh
-# Producer
-cd /Volumes/ext1/swe/repos/glb-optimizer
-lisa status                                              # DAG overview
-glb-optimizer prepare inbox/<file>.glb -category round-bush -resolution 256  # bake one asset
-glb-optimizer pack-inspect <species>                     # inspect a pack
-just validate                                            # validate Blender output vs known-good
-go test ./...                                            # Go tests (3.3s)
+# Bake one species
+glb-optimizer prepare inbox/<file>.glb -category round-bush -resolution 256
 
-# Consumer
-cd /Users/johnchen/swe/repos/plantastic/web
-lisa status                                              # DAG overview
-pnpm demo:check                                         # single readiness check
-pnpm test:unit                                           # all tests (478 pass, ~15s)
-pnpm test:unit plant-pack-real                           # real-pack loader test
-pnpm dev --host 0.0.0.0                                  # dev server on tailscale
-pnpm prebuild                                            # regenerate plants-registry.json
+# Bake all inbox items
+glb-optimizer prepare-all -category round-bush -resolution 256
+
+# Inspect a pack
+glb-optimizer pack-inspect <species>
+
+# Run tests
+go test ./...
+
+# Check project status
+lisa status
 ```
 
-## Uncommitted fixes to be aware of
-
-These were made during live debugging and may not be committed yet:
-
-| File | Fix | Why |
-|---|---|---|
-| `scripts/render_production.py` | EEVEE engine name: try `BLENDER_EEVEE` before `BLENDER_EEVEE_NEXT` | Blender 5.1 renamed it back |
-| `scripts/render_production.py` | `use_bloom` guarded with `hasattr` | Removed in Blender 5.x |
-| `scripts/render_production.py` | `calc_normals` guarded with `hasattr` | Removed in Blender 5.x |
-| `scripts/render_production.py` | `render_to_image` saves to temp file instead of reading Render Result pixels | Blender 5.x returns empty pixels from `bpy.data.images["Render Result"]` |
-| `scripts/render_production.py` | Cycles CPU for headless, EEVEE for headed | EEVEE needs GPU context unavailable in `blender -b` |
-| `prepare_cmd.go` | Blender source path: `originals/{id}.glb` not `outputs/{id}.glb` | gltfpack's `EXT_meshopt_compression` not supported by Blender's importer |
-| `main.go` | Server binds `0.0.0.0` instead of `localhost` | Tailscale access for demo |
-
-## Architecture references
-
-- **Pack v1 spec**: `glb-optimizer/docs/active/epics/E-002-asset-pack-format.md` §"Pack Format v1 — The Contract"
-- **Rendering parameters**: `glb-optimizer/docs/knowledge/production-render-params.md`
-- **Demo deployment**: `plantastic/docs/laptop-dev-setup.md` + `plantastic/web/README.md` USB section
-- **Crossfade math**: `plantastic/web/src/lib/three/species-instancer.ts` — ported verbatim from `glb-optimizer/static/app.js:4197`
-
-## Cross-repo coordination
-
-Agents can read each other's repos and run `lisa status` for coordination. The two integration gates (glb-optimizer T-011-04 and plantastic T-083-05) are both done — the handshake protocol is documented in their ticket bodies for reference if a re-handshake is ever needed.
-
-## How to add a new plant species
+## How to add a new species to the catalog
 
 ```sh
 # 1. Drop source GLB in inbox
-cp ~/Downloads/new_plant.glb /Volumes/ext1/swe/repos/glb-optimizer/inbox/
+cp ~/Downloads/new_plant.glb inbox/
 
-# 2. Bake (15s, no browser)
-cd /Volumes/ext1/swe/repos/glb-optimizer
+# 2. Bake (15s per species)
 glb-optimizer prepare inbox/new_plant.glb -category round-bush -resolution 256
 
-# 3. Deploy pack to plantastic
-cp ~/.glb-optimizer/dist/plants/new_plant.glb /Users/johnchen/swe/repos/plantastic/web/static/potree-viewer/assets/plants/
+# 3. Upload pack + source to R2
+cd /Volumes/ext1/swe/repos/plant-catalog
+pnpm exec wrangler r2 object put plant-assets/packs/new_plant.glb \
+  --file ~/.glb-optimizer/dist/plants/new_plant.glb \
+  --content-type model/gltf-binary --remote
+pnpm exec wrangler r2 object put plant-assets/sources/new_plant.glb \
+  --file ~/.glb-optimizer/originals/<hash>.glb \
+  --content-type model/gltf-binary --remote
 
-# 4. Add to manifest
-echo "new_plant" >> /Users/johnchen/swe/repos/plantastic/web/static/potree-viewer/assets/plants/MANIFEST.txt
+# 4. Extract and upload thumbnail
+node scripts/extract-thumbnail.mjs ~/.glb-optimizer/dist/plants/new_plant.glb
+pnpm exec wrangler r2 object put plant-assets/thumbnails/new_plant.webp \
+  --file new_plant_thumb.webp --content-type image/webp --remote
 
-# 5. Regenerate registry + verify
-cd /Users/johnchen/swe/repos/plantastic/web
-pnpm prebuild
-pnpm demo:check
+# 5. Create species entry in EmDash (via admin UI or API)
 
-# 6. Add to SCENE_BEDS in demo-scene.ts
-# Edit the species array in the relevant bed spec
+# 6. Verify in catalog: https://plant-catalog.john-hk-chen.workers.dev
 ```
